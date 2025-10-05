@@ -178,7 +178,6 @@ def execute_order(signal, current_price):
             bot_state["current_state"]["balances"][f"free_{base_asset}"] += quantity
         else:
             print(f"💰 BUY (Real): Enviando orden para comprar {quantity:.2f} {base_asset}...")
-            # Aquí se ejecutaría la orden de compra real:
             # order = client.create_order(symbol=SYMBOL, side='BUY', type='MARKET', quantity=quantity)
             # bot_state["trade_history"].append({"time": bot_state["current_state"]["last_run_utc"], "type": "BUY", "quantity": quantity, "price": current_price, "status": "executed"})
 
@@ -203,7 +202,6 @@ def execute_order(signal, current_price):
             bot_state["current_state"]["balances"][f"free_{base_asset}"] = 0.0
         else:
             print(f"💸 SELL (Real): Enviando orden para vender {quantity:.2f} {base_asset}...")
-            # Aquí se ejecutaría la orden de venta real:
             # order = client.create_order(symbol=SYMBOL, side='SELL', type='MARKET', quantity=quantity)
             # bot_state["trade_history"].append({"time": bot_state["current_state"]["last_run_utc"], "type": "SELL", "quantity": quantity, "price": current_price, "status": "executed"})
 
@@ -217,6 +215,10 @@ def bot_loop():
     
     print(f"🤖 Bot iniciado en TESTNET (DRY_RUN={DRY_RUN}, SYMBOL={SYMBOL}).")
     
+    # Forzar la primera actualización de balances antes de entrar al bucle de espera
+    update_balances()
+    print("✅ Balances iniciales cargados en el estado.")
+
     while True:
         # A. MANEJO DE ERRORES: CRÍTICO para Render
         try:
@@ -267,15 +269,19 @@ def get_state():
     """Ruta para obtener el estado actual del bot en formato JSON."""
     return jsonify(bot_state)
 
-# --- 7. INICIO DEL SERVIDOR Y DEL THREAD ---
+# --- 7. INICIO DEL SERVIDOR Y DEL THREAD (Fuera de if __name__ == '__main__') ---
 
-if __name__ == '__main__':
-    # Iniciar el hilo de trading en segundo plano una única vez
-    if not bot_thread_running:
+# FORZAR EL INICIO DEL HILO Y ASEGURAR QUE SÓLO CORRA UNA VEZ POR PROCESO
+if not bot_thread_running:
+    # Usamos un try/except simple aquí para el inicio
+    try:
         trading_thread = threading.Thread(target=bot_loop)
         trading_thread.start()
-        print("🌐 Hilo de trading iniciado.")
-        
-    # El servidor Gunicorn (desde el Procfile) se encargará de ejecutar Flask.
-    # Esta línea se ejecuta en local, Gunicorn la ignora al ser el punto de entrada.
-    # app.run(host='0.0.0.0', port=os.environ.get('PORT', 5000))
+        print("🌐 Hilo de trading iniciado con éxito en segundo plano.")
+    except Exception as e:
+        print(f"❌ ERROR CRÍTICO: No se pudo iniciar el hilo de trading: {e}")
+
+# El servidor Gunicorn ahora mantiene la aplicación (y el hilo) viva.
+# Si el script se ejecuta directamente (ej: python trading_bot.py), también funcionará.
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=os.environ.get('PORT', 5000))
