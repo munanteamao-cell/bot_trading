@@ -1,0 +1,4 @@
+flask
+python-binance==1.0.15
+pandas
+numpy
