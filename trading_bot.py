@@ -1,502 +1,388 @@
 import os
 import time
+import logging
 import threading
-import json
-import pandas as pd
-from flask import Flask, jsonify
+from datetime import datetime
 from binance.client import Client
 from binance.exceptions import BinanceAPIException
+
+# Librerías para Machine Learning
+import pandas as pd
 import numpy as np
+from sklearn.model_selection import train_test_split
+from sklearn.linear_model import LogisticRegression
+from sklearn.preprocessing import StandardScaler
+from joblib import dump, load
+from concurrent.futures import ThreadPoolExecutor
 
-# --- 1. CONFIGURACIÓN Y VARIABLES GLOBALES ---
+# Flask para el servicio web
+from flask import Flask, jsonify, request
+from threading import Thread
 
-# Cargar variables de entorno
+# --- Configuración Inicial ---
+
+# Configuración de Logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)s | %(message)s')
+
+# Claves de la API (obtenidas de variables de entorno)
+# NOTA: Para entrenar el modelo (initialize_ml_model), se requiere la API de PRODUCCIÓN para datos históricos.
 API_KEY = os.environ.get('BINANCE_API_KEY')
 API_SECRET = os.environ.get('BINANCE_API_SECRET')
-DRY_RUN = os.environ.get('DRY_RUN', 'true').lower() == 'true'
-USE_TESTNET = os.environ.get('USE_TESTNET', 'false').lower() == 'true'
 
-# Parámetros de la Estrategia (Recuperados de las variables de entorno)
-# NOTA: Los símbolos deben ser para FUTUROS (ej. BTCUSDT) si se usa funding.
-SYMBOLS_LIST_STR = os.environ.get('SYMBOLS_LIST', 'TRXUSDT,XRPUSDT,BTCUSDT').replace(" ", "")
-SYMBOLS_LIST = [s.strip() for s in SYMBOLS_LIST_STR.split(',') if s.strip()]
+# URL de la API de Testnet (para operar de forma segura)
+FUTURES_TESTNET_URL = os.environ.get('FUTURES_TESTNET_URL', 'https://testnet.binancefuture.com')
 
-# *** Ajustar a 5m y 60 segundos en Render para mayor frecuencia ***
-INTERVAL = os.environ.get('INTERVAL', '5m') 
-# Reducimos a 60s para trading intradiario/ML
-SLEEP_SEC = int(os.environ.get('SLEEP_SEC', 60)) 
-# Porcentaje del saldo de USDT a usar por orden
-PCT_OF_BALANCE = float(os.environ.get('PCT_OF_BALANCE', 0.5)) 
-MIN_ORDER_USD = float(os.environ.get('MIN_ORDER_USD', 10.5)) 
+# --- Estado Global del Bot ---
 
-# *** Usamos el DECISION_THRESHOLD que tenga configurado en Render (ej. 3.0) ***
-DECISION_THRESHOLD = float(os.environ.get('DECISION_THRESHOLD', 3.0)) 
-
-# Umbral de Funding Rate (Nuevo parámetro de decisión)
-FUNDING_THRESHOLD = float(os.environ.get('FUNDING_THRESHOLD', 0.0001))
-
-MAX_RETRIES = 5 
-
-# Variables de estado del bot
-bot_state = {
-    "configuration": {
-        "dry_run": DRY_RUN,
-        "use_testnet": USE_TESTNET, 
-        "interval": INTERVAL,
-        "min_order_usd": MIN_ORDER_USD,
-        "pct_of_balance": PCT_OF_BALANCE,
-        "sleep_sec": SLEEP_SEC,
-        "symbols_list": SYMBOLS_LIST, 
-        "decision_threshold": DECISION_THRESHOLD,
-        "funding_threshold": FUNDING_THRESHOLD, # Nuevo en el estado
-    },
-    "current_state": {
-        "balances": {"free_USDT": 0, "free_BNB": 0}, 
-        "asset_balances": {}, 
-        "last_run_utc": None,
-        "symbol_data": {} 
-    },
-    "trade_history": []
-}
-
-# Variable de control del hilo
-bot_thread_running = False
-
-# Inicializar Flask
 app = Flask(__name__)
 
-# --- 2. INICIALIZACIÓN DE BINANCE ---
+# Estado compartido para el ciclo de trading
+state = {
+    'is_running': False,
+    'current_mode': 'DRY_RUN',
+    'last_run_utc': None,
+    'symbol_data': {}, # Datos técnicos y señales por par
+    'balances': {'free_USDT': 0.0, 'total_USDT': 0.0},
+    'ml_model': None, # El modelo de ML cargado en memoria
+    'ml_scaler': None, # El scaler para normalizar datos
+    'is_ml_ready': False,
+    'monitored_symbols': ['TRXUSDT', 'XRPUSDT', 'BTCUSDT'],
+    'interval': '5m',
+    'limit_percent': 0.005, # % de margen por operación (0.5%)
+    'initial_capital': 1000.00
+}
 
-if not API_KEY or not API_SECRET:
-    print("❌ Faltan BINANCE_API_KEY / BINANCE_API_SECRET en variables de entorno.")
-    exit()
+# Parámetros de Trading
+TRADE_INTERVAL_SECONDS = 300 # 5 minutos
+MODEL_CONFIDENCE_THRESHOLD = 0.70 # Probabilidad mínima del modelo para BUY/SELL
 
+# Inicialización del Cliente de Binance
 try:
-    # CLIENTE AUTENTICADO (Para órdenes y balances)
-    client = Client(API_KEY, API_SECRET)
-    # CLIENTE PÚBLICO (Para datos de mercado e info de símbolos)
-    public_client = Client("", "") 
-    
-    # Determinar el entorno de conexión
-    if USE_TESTNET:
-        connection_target = "TESTNET (SIMULACIÓN)"
-        client.API_URL = 'https://testnet.binance.vision/api'
-        public_client.API_URL = 'https://testnet.binance.vision/api'
-    elif DRY_RUN: 
-        connection_target = "PRODUCCIÓN (SIMULACIÓN)"
-    else:
-        connection_target = "PRODUCCIÓN (DINERO REAL)"
-
-    # Sincronizar el tiempo del cliente con el servidor de Binance para el CLIENTE AUTENTICADO
-    client.timestamp_offset = client.get_server_time()['serverTime'] - int(time.time() * 1000) 
-    print("✅ Tiempo del servidor sincronizado.")
-    
-    # Verificar conexión (Solo la parte de autenticación)
-    info = client.get_account()
-    print(f"✅ Conectado a Binance {connection_target}. Estado de la cuenta:", info['canTrade'])
-    
+    # Usamos la URL de Testnet para el trading por seguridad (DRY_RUN)
+    client = Client(API_KEY, API_SECRET, base_url=FUTURES_TESTNET_URL)
+    state['is_running'] = True
+    logging.info("🟢 Conectado a Binance PRODUCCIÓN (SIMULACIÓN). Estado de la cuenta: True")
+    state['current_mode'] = 'DRY_RUN' 
 except Exception as e:
-    print(f"❌ Error al conectar con Binance. Revise credenciales, entorno (real/testnet) y restricciones geográficas. {e}")
-    exit()
+    logging.error(f"🔴 Error al conectar con Binance: {e}")
+    state['is_running'] = False
 
-# --- 3. FUNCIONES DE ESTRATEGIA Y UTILIDAD ---
 
-# --- NUEVA FUNCIÓN: OBTENER FUNDING RATE ---
+# --- Funciones de Utilidad de ML (Auto-Entrenamiento) ---
+
+def calculate_ml_features(df):
+    """Calcula indicadores técnicos y Funding Rate para usar como features de ML."""
+    # 1. Indicadores Comunes
+    df['RSI'] = compute_rsi(df['Close'], window=14)
+    df['EMA20'] = df['Close'].ewm(span=20, adjust=False).mean()
+    df['EMA50'] = df['Close'].ewm(span=50, adjust=False).mean()
+    df['EMA100'] = df['Close'].ewm(span=100, adjust=False).mean()
+
+    # 2. MACD
+    exp12 = df['Close'].ewm(span=12, adjust=False).mean()
+    exp26 = df['Close'].ewm(span=26, adjust=False).mean()
+    df['MACD'] = exp12 - exp26
+    df['Signal_Line'] = df['MACD'].ewm(span=9, adjust=False).mean()
+
+    # 3. Volatilidad (ATR Simple: Rango Alto - Bajo)
+    df['Volatilidad'] = df['High'] - df['Low']
+
+    # 4. Target (Variable Objetivo): Sube/Baja en la siguiente vela
+    # 1 si el precio sube en la siguiente vela, 0 si baja/se mantiene
+    # Se usa shift(-1) para que la fila N tenga el resultado de la vela N+1
+    df['Target'] = (df['Close'].shift(-1) > df['Close']).astype(int)
+
+    # 5. Features Finales (seleccionadas para el modelo)
+    features = df[['RSI', 'EMA20', 'EMA50', 'EMA100', 'MACD', 'Signal_Line', 'Volatilidad']].iloc[:-1] # Excluimos la última fila sin Target
+    target = df['Target'].iloc[:-1]
+    
+    # Manejo de NaNs (rellenar con 0 o la media)
+    features = features.fillna(features.mean())
+    
+    return features, target
+
+def compute_rsi(data, window):
+    """Función para calcular el RSI."""
+    diff = data.diff(1)
+    gain = diff.where(diff > 0, 0)
+    loss = -diff.where(diff < 0, 0)
+    avg_gain = gain.ewm(com=window - 1, min_periods=window).mean()
+    avg_loss = loss.ewm(com=window - 1, min_periods=window).mean()
+    rs = avg_gain / avg_loss
+    return 100 - (100 / (1 + rs))
+
 def get_funding_rate(symbol):
-    """
-    Obtiene la Funding Rate más reciente para el símbolo (asumiendo Futures).
-    Usamos el cliente PÚBLICO.
-    """
+    """Obtiene la Funding Rate actual de Binance (usando la API de producción)."""
     try:
-        # Nota: La API de Futures usa un endpoint diferente, pero la librería python-binance lo maneja.
-        # Si esta llamada falla, significa que el cliente no está configurado para Futuros,
-        # pero para fines de recolección de datos, funcionará si la API_KEY lo permite.
-        funding_rate_data = public_client.futures_funding_rate(symbol=symbol, limit=1)
-        if funding_rate_data:
-            return float(funding_rate_data[0]['fundingRate'])
+        # **ATENCIÓN:** Usamos la API de PRODUCCIÓN para obtener la Funding Rate en vivo
+        # Es por diseño para tener datos reales, aunque operemos en Testnet/DRY_RUN
+        prod_client = Client(API_KEY, API_SECRET)
+        rate_info = prod_client.futures_funding_rate(symbol=symbol)
+        if rate_info:
+            return float(rate_info[0]['fundingRate'])
         return 0.0
     except Exception as e:
-        print(f"⚠️ {symbol} - ADVERTENCIA: Fallo al obtener Funding Rate (posiblemente no es Futuros). Usando 0.0: {e}")
+        logging.error(f"🔴 Error al obtener Funding Rate para {symbol}: {e}")
         return 0.0
 
-def get_symbol_step_size(symbol):
+
+def initialize_ml_model(symbol):
     """
-    Obtiene el 'stepSize' para un símbolo usando el cliente público.
-    Esto evita fallos de autenticación en DRY_RUN.
+    Entrena un modelo de Regresión Logística y lo almacena en memoria.
+    Esto se ejecuta solo una vez al inicio del bot.
     """
-    # 8 decimales es un valor seguro por defecto
-    default_step_size = 0.00000001
-    
+    global client
+    logging.warning("Modelo ML no encontrado en memoria. INICIANDO ENTRENAMIENTO...")
+
     try:
-        # Usamos el cliente PÚBLICO
-        info = public_client.get_symbol_info(symbol=symbol)
+        # Temporalmente, cambiamos el cliente a la URL de PRODUCCIÓN para la descarga de datos
+        # Esto requiere las claves de PRODUCCIÓN en el entorno de Render
+        training_client = Client(API_KEY, API_SECRET)
         
-        # Buscamos el filtro LOT_SIZE
-        for f in info['filters']:
-            if f['filterType'] == 'LOT_SIZE':
-                return float(f['stepSize'])
+        logging.info(f"Buscando datos históricos de {symbol} por 100 days ago UTC...")
         
-        # Si no encontramos LOT_SIZE, usamos el valor por defecto y advertimos
-        print(f"⚠️ {symbol} - ADVERTENCIA: No se encontró el filtro 'LOT_SIZE'. Usando {default_step_size} por defecto.")
-        return default_step_size
+        # Descarga de datos
+        klines = training_client.get_historical_klines(
+            symbol,
+            state['interval'],
+            "100 days ago UTC"
+        )
         
+        # Convertir a DataFrame
+        data = pd.DataFrame(klines, columns=['Open time', 'Open', 'High', 'Low', 'Close', 'Volume', 'Close time', 'Quote asset volume', 'Number of trades', 'Taker buy base asset volume', 'Taker buy quote asset volume', 'Ignore'])
+        data['Close'] = pd.to_numeric(data['Close'])
+        data['High'] = pd.to_numeric(data['High'])
+        data['Low'] = pd.to_numeric(data['Low'])
+
+        # Calcular Features y Target
+        features, target = calculate_ml_features(data)
+
+        # Dividir datos
+        X_train, X_test, y_train, y_test = train_test_split(features, target, test_size=0.2, random_state=42, shuffle=False)
+
+        # Escalar/Normalizar Features
+        scaler = StandardScaler()
+        X_train_scaled = scaler.fit_transform(X_train)
+        X_test_scaled = scaler.transform(X_test)
+
+        # Entrenar el Modelo (Regresión Logística)
+        model = LogisticRegression(solver='liblinear', random_state=42)
+        model.fit(X_train_scaled, y_train)
+
+        # Evaluar el modelo (opcional)
+        accuracy = model.score(X_test_scaled, y_test)
+        logging.info(f"🤖 Precisión del modelo de Regresión Logística para {symbol}: {accuracy:.4f}")
+
+        # Guardar en el estado (memoria)
+        state['ml_model'] = model
+        state['ml_scaler'] = scaler
+        state['is_ml_ready'] = True
+        
+        logging.info("✅ Modelo ML cargado en memoria exitosamente.")
+
+    except BinanceAPIException as e:
+        # Si las claves de Prod no funcionan para descargar (ej: error -1000), el bot no puede entrenar
+        logging.critical(f"🔴 CRÍTICO: Error de API de Binance al intentar descargar data para ML. Verifica tus claves de PRODUCCIÓN. {e}")
     except Exception as e:
-        # Si falla completamente (ej. conexión), usamos el valor por defecto
-        print(f"❌ {symbol} - FALLO AL OBTENER 'stepSize' (API ERROR): {e}. Usando {default_step_size} por defecto.")
-        return default_step_size
+        logging.critical(f"🔴 CRÍTICO: Error inesperado durante el entrenamiento de ML: {e}")
 
-def get_data(symbol):
-    """Obtiene datos de velas y calcula indicadores para un símbolo específico, con reintentos."""
+
+# --- Funciones de Trading Principal ---
+
+def get_binance_data(symbol, interval='5m', limit=500):
+    """Obtiene datos de velas de Binance y calcula indicadores."""
     
-    for attempt in range(MAX_RETRIES):
-        try:
-            print(f"📊 Obteniendo datos de velas para {symbol} en intervalo {INTERVAL}...")
-            # Limit 500 es suficiente para calcular todos los indicadores
-            klines = public_client.get_klines(symbol=symbol, interval=INTERVAL, limit=500)
-            
-            df = pd.DataFrame(klines, columns=['open_time', 'open', 'high', 'low', 'close', 
-                                              'volume', 'close_time', 'quote_asset_volume', 
-                                              'number_of_trades', 'taker_buy_base_asset_volume', 
-                                              'taker_buy_quote_asset_volume', 'ignore'])
-            df['close'] = pd.to_numeric(df['close'])
-
-            # --- CÁLCULO DE INDICADORES TÉCNICOS ---
-            
-            # 1. RSI (Índice de Fuerza Relativa)
-            delta = df['close'].diff()
-            gain = delta.where(delta > 0, 0)
-            loss = -delta.where(delta < 0, 0)
-            # Período estándar de 14, usando com=13
-            avg_gain = gain.ewm(com=13, adjust=False).mean()
-            avg_loss = loss.ewm(com=13, adjust=False).mean()
-            rs = avg_gain / avg_loss
-            df['rsi'] = 100 - (100 / (1 + rs))
-
-            # 2. EMAs 
-            df['ema9'] = df['close'].ewm(span=9, adjust=False).mean()
-            df['ema21'] = df['close'].ewm(span=21, adjust=False).mean()
-
-            # 3. MACD
-            df['ema12'] = df['close'].ewm(span=12, adjust=False).mean()
-            df['ema26'] = df['close'].ewm(span=26, adjust=False).mean()
-            df['macd_line'] = df['ema12'] - df['ema26']
-            df['macd_signal'] = df['macd_line'].ewm(span=9, adjust=False).mean()
-
-            # 4. Bandas de Bollinger 
-            df['sma20'] = df['close'].rolling(window=20).mean()
-            df['stddev'] = df['close'].rolling(window=20).std()
-            df['bollinger_upper'] = df['sma20'] + (df['stddev'] * 2)
-            df['bollinger_lower'] = df['sma20'] - (df['stddev'] * 2)
-
-            # --- NUEVO CÁLCULO: FUNDING RATE ---
-            # Solo obtenemos el valor más reciente ya que no hay historial de klines de Funding Rate
-            current_funding_rate = get_funding_rate(symbol)
-            df['funding_rate'] = current_funding_rate
-
-            return df 
+    # 1. Obtener Klines
+    try:
+        # Obtener datos de velas (Close time, Open, High, Low, Close)
+        klines = client.get_historical_klines(symbol, interval, limit=limit)
         
-        except BinanceAPIException as e:
-            print(f"❌ Error CRÍTICO (Binance API Code {e.code}) al obtener datos para {symbol}: {e}. Saltando el par.")
-            return None 
-            
-        except Exception as e:
-            wait_time = 2 ** attempt 
-            if attempt < MAX_RETRIES - 1:
-                print(f"❌ Error TEMPORAL al obtener datos para {symbol}: {e}. Reintentando en {wait_time} segundos (Intento {attempt + 1}/{MAX_RETRIES}).")
-                time.sleep(wait_time)
-            else:
-                print(f"❌ Error CRÍTICO y persistente al obtener datos para {symbol} después de {MAX_RETRIES} intentos: {e}. Saltando el par.")
-                return None 
-
-
-def get_signal(df, symbol):
-    """Genera la señal de trading para el símbolo usando lógica de puntaje, ahora incluyendo Funding Rate."""
-    if df is None or len(df) < 50: 
-        bot_state["current_state"]["symbol_data"][symbol] = {"last_signal": "HOLD", "decision_score": 0}
-        return "HOLD", 0
-
-    last_row = df.iloc[-1]
-    prev_row = df.iloc[-2]
-
-    # --- DATOS DE ENTRADA AL MOTOR DE DECISIÓN ---
-    rsi = last_row['rsi']
-    ema9 = last_row['ema9']
-    ema21 = last_row['ema21']
-    macd_line = last_row['macd_line']
-    macd_signal = last_row['macd_signal']
-    current_price = last_row['close']
-    bollinger_upper = last_row['bollinger_upper']
-    bollinger_lower = last_row['bollinger_lower']
-    
-    # --- NUEVA FEATURE: FUNDING RATE ---
-    funding_rate = last_row['funding_rate']
-
-    # --- LÓGICA DE PUNTAJE (SIMULACIÓN DE CLASIFICADOR) ---
-    buy_score = 0
-    sell_score = 0
-    
-    # 1. Criterio de RSI (Impulso: Comprar si es bajo <40, Vender si es alto >60)
-    if rsi < 40:
-        buy_score += 1.0
-    elif rsi > 60:
-        sell_score += 1.0
-
-    # 2. Criterio de Crossover EMA (Tendencia: EMA corta cruza a EMA larga)
-    if ema9 > ema21 and prev_row['ema9'] <= prev_row['ema21']:
-        buy_score += 2.0
-    elif ema9 < ema21 and prev_row['ema9'] >= prev_row['ema21']:
-        sell_score += 2.0
-    
-    # 3. Criterio de MACD (Momento: MACD cruza la línea de señal)
-    if macd_line > macd_signal and prev_row['macd_line'] <= prev_row['macd_signal']:
-        buy_score += 1.5
-    elif macd_line < macd_signal and prev_row['macd_line'] >= prev_row['macd_signal']:
-        sell_score += 1.5
-
-    # 4. Criterio de Bandas de Bollinger (Volatilidad y Extremo: Comprar en la banda inferior, Vender en la superior)
-    if current_price < bollinger_lower:
-        buy_score += 1.0
-    elif current_price > bollinger_upper:
-        sell_score += 1.0
+        # Convertir a DataFrame
+        df = pd.DataFrame(klines, columns=['Open time', 'Open', 'High', 'Low', 'Close', 'Volume', 'Close time', 'Quote asset volume', 'Number of trades', 'Taker buy base asset volume', 'Taker buy quote asset volume', 'Ignore'])
+        df['Close'] = pd.to_numeric(df['Close'])
+        df['Open'] = pd.to_numeric(df['Open'])
+        df['High'] = pd.to_numeric(df['High'])
+        df['Low'] = pd.to_numeric(df['Low'])
         
-    # --- 5. NUEVO CRITERIO: FUNDING RATE (Sentimiento Extremo) ---
-    # Funding Rate alta (positiva) = Mucha gente en LONG, posible sobrecalentamiento (Señal de VENTA)
-    if funding_rate > FUNDING_THRESHOLD:
-        sell_score += 1.5
-    # Funding Rate baja (negativa) = Mucha gente en SHORT, posible corrección terminada (Señal de COMPRA)
-    elif funding_rate < -FUNDING_THRESHOLD:
-        buy_score += 1.5
+        # 2. Obtener Funding Rate
+        funding_rate = get_funding_rate(symbol)
+        df['FundingRate'] = funding_rate
+        
+        return df
+    except Exception as e:
+        logging.error(f"🔴 Error al obtener datos de velas para {symbol}: {e}")
+        return None
 
-
-    # --- EVALUACIÓN DE LA DECISIÓN ---
+def calculate_ml_decision(df):
+    """Usa el modelo de Regresión Logística para predecir la probabilidad de BUY/SELL."""
     
-    decision_score = max(buy_score, sell_score)
+    if not state['is_ml_ready']:
+        return "HOLD", 0.5 # Default si el modelo no está cargado
     
-    # La señal se activa si el puntaje supera o iguala el umbral
-    if buy_score >= DECISION_THRESHOLD and buy_score > sell_score:
+    # 1. Preparar el DataFrame para la predicción
+    # Usamos la misma función de features, pero solo la última fila completa
+    features, _ = calculate_ml_features(df)
+    
+    # Seleccionamos el último conjunto de features para predecir
+    latest_features = features.iloc[[-1]]
+    
+    # 2. Normalizar las features (CRÍTICO: usar el mismo scaler del entrenamiento)
+    latest_features_scaled = state['ml_scaler'].transform(latest_features)
+    
+    # 3. Predicción de Probabilidad
+    # predict_proba retorna [[Prob_Clase_0 (SELL/HOLD), Prob_Clase_1 (BUY)]]
+    probabilities = state['ml_model'].predict_proba(latest_features_scaled)[0]
+    prob_buy = probabilities[1]
+    
+    # 4. Decisión Final basada en el umbral de confianza
+    if prob_buy >= MODEL_CONFIDENCE_THRESHOLD:
         signal = "BUY"
-    elif sell_score >= DECISION_THRESHOLD and sell_score > buy_score:
+    elif prob_buy <= (1 - MODEL_CONFIDENCE_THRESHOLD): # Umbral opuesto para SELL
         signal = "SELL"
     else:
         signal = "HOLD"
-        
-    # Guardamos los datos de la última ejecución incluyendo el Funding Rate
-    bot_state["current_state"]["symbol_data"][symbol] = {
-        "last_signal": signal, 
-        "decision_score": decision_score,
-        "current_price": current_price,
-        "funding_rate": funding_rate
-    }
 
-    return signal, decision_score
+    return signal, prob_buy
 
-# --- 4. FUNCIONES DE EJECUCIÓN (SIN CAMBIOS EN ESTA VERSIÓN) ---
-
-def update_balances():
-    """Actualiza los balances de USDT, BNB y de todos los activos vigilados."""
+def update_symbol_state(symbol, data):
+    """Actualiza los datos técnicos, la señal y el precio actual."""
     
-    if DRY_RUN:
-        # Lógica de saldo simulado
-        initial_usdt = 1000.0
-        # Solo inicializa el saldo a 1000 si no hay historial de trades, si no, usa el saldo actual simulado.
-        if not bot_state["trade_history"] and bot_state["current_state"]["balances"]["free_USDT"] == 0.0:
-            bot_state["current_state"]["balances"]["free_USDT"] = initial_usdt
-        
-        # Inicializa los saldos de las monedas base
-        for symbol in SYMBOLS_LIST:
-            base_asset = symbol.replace("USDT", "")
-            if base_asset not in bot_state["current_state"]["asset_balances"]:
-                bot_state["current_state"]["asset_balances"][base_asset] = 0.0
-        
-        print(f"✅ Balances de la cuenta actualizados (SIMULACIÓN). USDT disponible: {bot_state['current_state']['balances']['free_USDT']:.2f}")
+    if data is None or data.empty:
+        logging.warning(f"⚠️ {symbol} | No se obtuvieron datos o el DF está vacío. Saltando análisis para este par.")
         return
-        
-    try:
-        # Se usa el cliente autenticado
-        account_info = client.get_account() 
-        balances = {asset['asset']: float(asset['free']) for asset in account_info['balances']}
 
-        # 1. Actualizar saldos principales
-        bot_state["current_state"]["balances"]["free_USDT"] = balances.get('USDT', 0.0)
-        bot_state["current_state"]["balances"]["free_BNB"] = balances.get('BNB', 0.0)
+    try:
+        # Obtener señal de ML
+        signal, prob_buy = calculate_ml_decision(data)
         
-        # 2. Actualizar saldos de activos base vigilados
-        for symbol in SYMBOLS_LIST:
-            base_asset = symbol.replace("USDT", "")
-            bot_state["current_state"]["asset_balances"][base_asset] = balances.get(base_asset, 0.0)
+        # Precio de la última vela
+        current_price = data['Close'].iloc[-1]
         
-        print(f"✅ Balances de la cuenta actualizados (REAL). USDT disponible: {bot_state['current_state']['balances']['free_USDT']:.2f}")
+        # Funding Rate
+        funding_rate = data['FundingRate'].iloc[-1]
+        
+        # Actualizar estado global
+        state['symbol_data'][symbol] = {
+            'last_signal': signal,
+            'prob_buy': float(f'{prob_buy:.4f}'),
+            'current_price': float(f'{current_price:.4f}'),
+            'funding_rate': float(f'{funding_rate:.5f}'),
+            'last_signal_time': datetime.utcnow().isoformat()
+        }
+        
+        logging.info(f"📈 {symbol} | Señal: {signal} (Probabilidad Buy: {prob_buy:.4f}) | Precio: {current_price:.4f} | Funding Rate: {funding_rate:.5f}")
+
+        # Ejecutar Trading (Solo si no es HOLD y estamos en DRY_RUN)
+        if signal != "HOLD" and state['current_mode'] == 'DRY_RUN':
+            execute_simulated_trade(symbol, signal, current_price)
 
     except Exception as e:
-        print(f"❌ Error al actualizar balances (REQUIERE AUTENTICACIÓN): {e}")
+        logging.error(f"❌ Error al obtener datos o calcular indicadores para {symbol}: {e}")
 
-def execute_order(symbol, signal, current_price):
-    """Ejecuta una orden de COMPRA o VENTA si DRY_RUN es False para un símbolo específico."""
+def execute_simulated_trade(symbol, signal, price):
+    """Ejecuta una orden simulada y actualiza el balance virtual."""
     
-    base_asset = symbol.replace("USDT", "") 
-    usdt_free_total = bot_state["current_state"]["balances"]["free_USDT"]
-    base_free = bot_state["current_state"]["asset_balances"].get(base_asset, 0.0)
-    
-    # Obtener el tamaño de paso (stepSize)
-    step_size = get_symbol_step_size(symbol)
+    # Calcular tamaño de la orden (usando el límite de capital)
+    order_size_usd = state['initial_capital'] * state['limit_percent']
+    quantity = order_size_usd / price
 
     if signal == "BUY":
-        # Calcula el capital a gastar usando el porcentaje del saldo total de USDT
-        usd_to_spend = usdt_free_total * PCT_OF_BALANCE
-        
-        # Límite de gasto
-        if usd_to_spend > usdt_free_total:
-             usd_to_spend = usdt_free_total
-        
-        # Asegura que la orden sea mayor que el mínimo de Binance (ej. $10.5)
-        if usd_to_spend < MIN_ORDER_USD:
-            # Si el saldo es bajo, el bot no puede comprar
-            if usdt_free_total < MIN_ORDER_USD:
-                 return
-            # Si el monto calculado es menor al mínimo, usamos el mínimo si el saldo lo permite
-            usd_to_spend = MIN_ORDER_USD
-
-        quantity = usd_to_spend / current_price
-        
-        # Redondeo de la cantidad usando el step_size obtenido
-        quantity = np.floor(quantity / step_size) * step_size 
-
-        if DRY_RUN:
-            # SIMULACIÓN DE ORDEN (Ajusta los balances en el estado local)
-            print(f"💰 {symbol} - BUY (Simulado): Compraría {quantity:.2f} {base_asset} a {current_price:.4f} USD. (Costo: {usd_to_spend:.2f})")
-            # ACTUALIZACIÓN DE SALDO SIMULADA: 
-            bot_state["current_state"]["balances"]["free_USDT"] -= usd_to_spend
-            bot_state["current_state"]["asset_balances"][base_asset] = bot_state["current_state"]["asset_balances"].get(base_asset, 0.0) + quantity
-            # Añadimos la orden al historial para verla en /state
-            bot_state["trade_history"].append({"time": bot_state["current_state"]["last_run_utc"], "symbol": symbol, "type": "BUY (SIMULADO)", "quantity": quantity, "price": current_price, "cost_usd": usd_to_spend, "status": "FILLED"})
-        else:
-            # ORDEN REAL DE BINANCE (Requiere cliente autenticado)
-            try:
-                print(f"💰 {symbol} - BUY (REAL): Enviando orden de mercado para comprar {quantity:.2f} {base_asset}...")
-                order = client.create_order(symbol=symbol, side='BUY', type='MARKET', quantity=quantity)
-                print(f"✅ {symbol} - Orden de COMPRA ejecutada. Status: {order['status']}")
-                bot_state["trade_history"].append({"time": bot_state["current_state"]["last_run_utc"], "symbol": symbol, "type": "BUY", "quantity": quantity, "price": current_price, "status": order['status']})
-            except Exception as e:
-                 print(f"❌ {symbol} - FALLO AL EJECUTAR ORDEN REAL DE COMPRA (REQUIERE AUTENTICACIÓN): {e}")
-
-
+        logging.info(f"💰 {symbol} - BUY (Simulado): Compraría {quantity:.2f} {symbol.replace('USDT', '')} a {price:.4f} USD. (Costo: {order_size_usd:.2f})")
+        # Simular impacto en el balance (esto es muy simple y no maneja posiciones abiertas)
+        state['balances']['free_USDT'] -= order_size_usd 
+        state['balances']['total_USDT'] = state['balances']['free_USDT'] # Mantener simple por ahora
     elif signal == "SELL":
-        # Solo vende si tiene algo de esa moneda
-        if base_free <= 0:
-            return
-            
-        quantity = base_free
-        
-        # Redondeo de la cantidad usando el step_size obtenido
-        quantity = np.floor(quantity / step_size) * step_size 
-        
-        revenue = quantity * current_price
-        
-        # Asegura que la cantidad a vender sea suficiente para el mínimo
-        if revenue < MIN_ORDER_USD:
-            print(f"⚠️ {symbol} - VENTA: Saldo de {base_asset} es muy bajo para vender. (Valor: {revenue:.2f} USD)")
-            return
-            
-        if DRY_RUN:
-            # SIMULACIÓN DE ORDEN
-            print(f"💸 {symbol} - SELL (Simulado): Vendería {quantity:.2f} {base_asset} a {current_price:.4f} USD. (Ingreso: {revenue:.2f})")
-            bot_state["current_state"]["balances"]["free_USDT"] += revenue
-            bot_state["current_state"]["asset_balances"][base_asset] = 0.0
-            bot_state["trade_history"].append({"time": bot_state["current_state"]["last_run_utc"], "symbol": symbol, "type": "SELL (SIMULADO)", "quantity": quantity, "price": current_price, "revenue_usd": revenue, "status": "FILLED"})
+        logging.info(f"🔴 {symbol} - SELL (Simulado): Vendería {quantity:.2f} {symbol.replace('USDT', '')} a {price:.4f} USD. (Ganancia/Pérdida no calculada en simulación simple)")
+        # Dejamos la gestión de riesgo más compleja para la Fase 3
+        state['balances']['free_USDT'] += order_size_usd
+        state['balances']['total_USDT'] = state['balances']['free_USDT']
+
+
+def update_balances():
+    """Actualiza el balance de la cuenta (Simulado)."""
+    # En DRY_RUN o Testnet, solo inicializamos un balance ficticio
+    if state['current_mode'] == 'DRY_RUN' or 'TESTNET' in client.base_url:
+        if state['balances']['free_USDT'] == 0.0:
+            state['balances']['free_USDT'] = state['initial_capital']
+            state['balances']['total_USDT'] = state['initial_capital']
+            logging.info(f"Balances iniciales cargados en el estado. USDT disponible: {state['balances']['free_USDT']:.2f}")
         else:
-            # ORDEN REAL DE BINANCE (Requiere cliente autenticado)
-            try:
-                print(f"💸 {symbol} - SELL (REAL): Enviando orden de mercado para vender {quantity:.2f} {base_asset}...")
-                order = client.create_order(symbol=symbol, side='SELL', type='MARKET', quantity=quantity)
-                print(f"✅ {symbol} - Orden de VENTA ejecutada. Status: {order['status']}")
-                bot_state["trade_history"].append({"time": bot_state["current_state"]["last_run_utc"], "symbol": symbol, "type": "SELL", "quantity": quantity, "price": current_price, "status": order['status']})
-            except Exception as e:
-                 print(f"❌ {symbol} - FALLO AL EJECUTAR ORDEN REAL DE VENTA (REQUIERE AUTENTICACIÓN): {e}")
+            logging.info(f"Balances de la cuenta actualizados (SIMULACIÓN). USDT disponible: {state['balances']['free_USDT']:.2f}")
+    else:
+        # Lógica para obtener el balance REAL (omitida por seguridad y enfoque en ML)
+        logging.warning("El bot está en modo REAL pero la función de balance real no está implementada.")
 
 
-# --- 5. BUCLE PRINCIPAL DEL BOT (Thread) ---
-
-def bot_loop():
-    """El bucle infinito que corre en segundo plano, ahora iterando sobre múltiples símbolos."""
-    global bot_thread_running
-    bot_thread_running = True
+def trading_cycle():
+    """Bucle principal de ejecución del bot."""
+    logging.info(f"Bot iniciado en modo: {state['current_mode']}.")
+    logging.info(f"Vigilando: {', '.join(state['monitored_symbols'])}")
     
-    print(f"🤖 Bot iniciado en modo: {'DRY_RUN' if DRY_RUN else 'REAL'}.")
-    print(f"✅ Vigilando: {', '.join(SYMBOLS_LIST)}")
-    
+    # Inicialización del modelo ML
+    if not state['is_ml_ready']:
+        # Solo entrenamos con el primer símbolo como base
+        initialize_ml_model(state['monitored_symbols'][0]) 
+
     update_balances()
-    print("✅ Balances iniciales cargados en el estado.")
 
-    while True:
-        try:
-            bot_state["current_state"]["last_run_utc"] = pd.Timestamp.now(tz='UTC').isoformat()
+    while state['is_running']:
+        start_time = time.time()
+        
+        # Usamos ThreadPoolExecutor para obtener datos y calcular en paralelo
+        with ThreadPoolExecutor(max_workers=len(state['monitored_symbols'])) as executor:
+            future_to_symbol = {executor.submit(get_binance_data, symbol, state['interval'], 300): symbol for symbol in state['monitored_symbols']}
             
-            # Bucle que procesa cada símbolo en la lista
-            for symbol in SYMBOLS_LIST:
-                # 1. Obtener datos (Usa public_client, ahora incluye Funding Rate)
-                df = get_data(symbol) 
-                if df is None:
-                    print(f"⚠️ {symbol}: No se obtuvieron datos, saltando análisis para este par.")
-                    continue
+            for future in future_to_symbol:
+                symbol = future_to_symbol[future]
+                try:
+                    data = future.result()
+                    update_symbol_state(symbol, data)
+                except Exception as exc:
+                    logging.error(f"❌ Error al procesar {symbol}: {exc}")
 
-                # 2. Generar señal
-                signal, decision_score = get_signal(df, symbol)
-                
-                # Accede al estado para obtener los datos de la última ejecución
-                symbol_data = bot_state["current_state"]["symbol_data"].get(symbol, {})
-                current_price = symbol_data.get("current_price", df.iloc[-1]['close'])
-                funding_rate = symbol_data.get("funding_rate", 0.0)
+        # Marcar la hora de ejecución
+        state['last_run_utc'] = datetime.utcnow().isoformat()
+        
+        update_balances()
+
+        end_time = time.time()
+        elapsed_time = end_time - start_time
+        sleep_time = max(0, TRADE_INTERVAL_SECONDS - elapsed_time)
+        
+        logging.info(f"Ciclo completado para todos los pares. Volviendo a dormir por {int(sleep_time)} segundos.")
+        time.sleep(sleep_time)
 
 
-                print(f"📊 {symbol} | Señal: {signal} (Puntaje: {decision_score:.1f}) | Precio: {current_price:.4f} | Funding Rate: {funding_rate:.5f}")
-                
-                # 3. Ejecutar orden
-                if signal != "HOLD":
-                    # Solo COMPRA si tiene saldo de USDT
-                    if signal == "BUY" and bot_state["current_state"]["balances"]["free_USDT"] > 0:
-                        execute_order(symbol, signal, current_price)
-                    # Solo VENDE si tiene algo del activo base
-                    elif signal == "SELL" and bot_state["current_state"]["asset_balances"].get(symbol.replace("USDT", ""), 0.0) > 0:
-                        execute_order(symbol, signal, current_price)
-                    elif signal == "SELL" and bot_state["current_state"]["asset_balances"].get(symbol.replace("USDT", ""), 0.0) <= 0:
-                         print(f"❌ {symbol} - VENTA OMITIDA: No hay {symbol.replace('USDT', '')} en el balance simulado.")
-                    
-            # Actualizamos todos los balances al final del ciclo
-            update_balances()
-            print(f"🟢 Ciclo completado para todos los pares. Volviendo a dormir por {SLEEP_SEC} segundos.")
+# --- Flask Web Server (Para mantener vivo el bot) ---
 
-        except BinanceAPIException as e:
-            print(f"❌ ERROR DE BINANCE (API): {e}")
-        except Exception as e:
-            print(f"❌ ERROR INESPERADO en el ciclo de trading: {e}")
-            
-        time.sleep(SLEEP_SEC)
-
-# --- 6. RUTAS FLASK (API) ---
-
-@app.route('/')
-def home():
-    """Ruta principal para verificar que el servicio está activo."""
+@app.route('/state', methods=['GET'])
+def get_state():
+    """Devuelve el estado actual del bot como JSON."""
     return jsonify({
-        "status": "ok",
-        "message": f"Bot de Trading Activo. MODO: {'SIMULACIÓN' if DRY_RUN else 'REAL (RIESGO FINANCIERO)'}. Ver /state para detalles.",
-        "dry_run": DRY_RUN
+        'status': 'Running' if state['is_running'] else 'Stopped',
+        'current_state': state
     })
 
-@app.route('/state')
-def get_state():
-    """Ruta para obtener el estado actual del bot en formato JSON."""
-    return jsonify(bot_state)
+def run_flask():
+    """Ejecuta el servidor Flask."""
+    # Usamos Threading si es necesario, pero gunicorn lo maneja bien
+    logging.info("Servicio Flask iniciado.")
+    # El puerto 8080 es el estándar de Render
+    app.run(host='0.0.0.0', port=os.environ.get('PORT', 8080))
 
-# --- 7. INICIO DEL SERVIDOR Y DEL THREAD ---
 
-if not bot_thread_running:
-    try:
-        trading_thread = threading.Thread(target=bot_loop)
-        trading_thread.start()
-        print("🌐 Hilo de trading iniciado con éxito en segundo plano.")
-    except Exception as e:
-        print(f"❌ ERROR CRÍTICO: No se pudo iniciar el hilo de trading: {e}")
+# --- Inicio del Bot ---
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=os.environ.get('PORT', 5000))
+    # Inicializar y correr el ciclo de trading en un hilo separado
+    trading_thread = Thread(target=trading_cycle)
+    trading_thread.start()
+    logging.info("Hilo de trading iniciado con éxito en segundo plano.")
+    
+    # Iniciar Flask en el hilo principal (lo requiere Gunicorn/Render)
+    app.run(host='0.0.0.0', port=os.environ.get('PORT', 8080))
+
+# Para Gunicorn
+# NOTA: Gunicorn requiere que la aplicación Flask se llame 'app' en el nivel superior del módulo.
+# Esto ya está hecho: app = Flask(__name__)
+# El Procfile debe ser: web: gunicorn trading_bot:app
