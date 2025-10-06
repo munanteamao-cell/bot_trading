@@ -17,18 +17,23 @@ DRY_RUN = os.environ.get('DRY_RUN', 'true').lower() == 'true'
 USE_TESTNET = os.environ.get('USE_TESTNET', 'false').lower() == 'true'
 
 # Parámetros de la Estrategia (Recuperados de las variables de entorno)
+# NOTA: Los símbolos deben ser para FUTUROS (ej. BTCUSDT) si se usa funding.
 SYMBOLS_LIST_STR = os.environ.get('SYMBOLS_LIST', 'TRXUSDT,XRPUSDT,BTCUSDT').replace(" ", "")
 SYMBOLS_LIST = [s.strip() for s in SYMBOLS_LIST_STR.split(',') if s.strip()]
 
-# *** CAMBIO AQUÍ: Usamos 5m si no se especifica. Debe ajustarlo en Render. ***
-INTERVAL = os.environ.get('INTERVAL', '5m')
+# *** Ajustar a 5m y 60 segundos en Render para mayor frecuencia ***
+INTERVAL = os.environ.get('INTERVAL', '5m') 
+# Reducimos a 60s para trading intradiario/ML
+SLEEP_SEC = int(os.environ.get('SLEEP_SEC', 60)) 
 # Porcentaje del saldo de USDT a usar por orden
 PCT_OF_BALANCE = float(os.environ.get('PCT_OF_BALANCE', 0.5)) 
-SLEEP_SEC = int(os.environ.get('SLEEP_SEC', 300))
 MIN_ORDER_USD = float(os.environ.get('MIN_ORDER_USD', 10.5)) 
 
 # *** Usamos el DECISION_THRESHOLD que tenga configurado en Render (ej. 3.0) ***
 DECISION_THRESHOLD = float(os.environ.get('DECISION_THRESHOLD', 3.0)) 
+
+# Umbral de Funding Rate (Nuevo parámetro de decisión)
+FUNDING_THRESHOLD = float(os.environ.get('FUNDING_THRESHOLD', 0.0001))
 
 MAX_RETRIES = 5 
 
@@ -42,7 +47,8 @@ bot_state = {
         "pct_of_balance": PCT_OF_BALANCE,
         "sleep_sec": SLEEP_SEC,
         "symbols_list": SYMBOLS_LIST, 
-        "decision_threshold": DECISION_THRESHOLD
+        "decision_threshold": DECISION_THRESHOLD,
+        "funding_threshold": FUNDING_THRESHOLD, # Nuevo en el estado
     },
     "current_state": {
         "balances": {"free_USDT": 0, "free_BNB": 0}, 
@@ -95,6 +101,24 @@ except Exception as e:
 
 # --- 3. FUNCIONES DE ESTRATEGIA Y UTILIDAD ---
 
+# --- NUEVA FUNCIÓN: OBTENER FUNDING RATE ---
+def get_funding_rate(symbol):
+    """
+    Obtiene la Funding Rate más reciente para el símbolo (asumiendo Futures).
+    Usamos el cliente PÚBLICO.
+    """
+    try:
+        # Nota: La API de Futures usa un endpoint diferente, pero la librería python-binance lo maneja.
+        # Si esta llamada falla, significa que el cliente no está configurado para Futuros,
+        # pero para fines de recolección de datos, funcionará si la API_KEY lo permite.
+        funding_rate_data = public_client.futures_funding_rate(symbol=symbol, limit=1)
+        if funding_rate_data:
+            return float(funding_rate_data[0]['fundingRate'])
+        return 0.0
+    except Exception as e:
+        print(f"⚠️ {symbol} - ADVERTENCIA: Fallo al obtener Funding Rate (posiblemente no es Futuros). Usando 0.0: {e}")
+        return 0.0
+
 def get_symbol_step_size(symbol):
     """
     Obtiene el 'stepSize' para un símbolo usando el cliente público.
@@ -136,7 +160,7 @@ def get_data(symbol):
                                               'taker_buy_quote_asset_volume', 'ignore'])
             df['close'] = pd.to_numeric(df['close'])
 
-            # --- CÁLCULO DE INDICADORES ---
+            # --- CÁLCULO DE INDICADORES TÉCNICOS ---
             
             # 1. RSI (Índice de Fuerza Relativa)
             delta = df['close'].diff()
@@ -164,6 +188,11 @@ def get_data(symbol):
             df['bollinger_upper'] = df['sma20'] + (df['stddev'] * 2)
             df['bollinger_lower'] = df['sma20'] - (df['stddev'] * 2)
 
+            # --- NUEVO CÁLCULO: FUNDING RATE ---
+            # Solo obtenemos el valor más reciente ya que no hay historial de klines de Funding Rate
+            current_funding_rate = get_funding_rate(symbol)
+            df['funding_rate'] = current_funding_rate
+
             return df 
         
         except BinanceAPIException as e:
@@ -181,7 +210,7 @@ def get_data(symbol):
 
 
 def get_signal(df, symbol):
-    """Genera la señal de trading para el símbolo usando lógica de puntaje."""
+    """Genera la señal de trading para el símbolo usando lógica de puntaje, ahora incluyendo Funding Rate."""
     if df is None or len(df) < 50: 
         bot_state["current_state"]["symbol_data"][symbol] = {"last_signal": "HOLD", "decision_score": 0}
         return "HOLD", 0
@@ -198,6 +227,9 @@ def get_signal(df, symbol):
     current_price = last_row['close']
     bollinger_upper = last_row['bollinger_upper']
     bollinger_lower = last_row['bollinger_lower']
+    
+    # --- NUEVA FEATURE: FUNDING RATE ---
+    funding_rate = last_row['funding_rate']
 
     # --- LÓGICA DE PUNTAJE (SIMULACIÓN DE CLASIFICADOR) ---
     buy_score = 0
@@ -226,6 +258,15 @@ def get_signal(df, symbol):
         buy_score += 1.0
     elif current_price > bollinger_upper:
         sell_score += 1.0
+        
+    # --- 5. NUEVO CRITERIO: FUNDING RATE (Sentimiento Extremo) ---
+    # Funding Rate alta (positiva) = Mucha gente en LONG, posible sobrecalentamiento (Señal de VENTA)
+    if funding_rate > FUNDING_THRESHOLD:
+        sell_score += 1.5
+    # Funding Rate baja (negativa) = Mucha gente en SHORT, posible corrección terminada (Señal de COMPRA)
+    elif funding_rate < -FUNDING_THRESHOLD:
+        buy_score += 1.5
+
 
     # --- EVALUACIÓN DE LA DECISIÓN ---
     
@@ -239,11 +280,17 @@ def get_signal(df, symbol):
     else:
         signal = "HOLD"
         
-    bot_state["current_state"]["symbol_data"][symbol] = {"last_signal": signal, "decision_score": decision_score}
+    # Guardamos los datos de la última ejecución incluyendo el Funding Rate
+    bot_state["current_state"]["symbol_data"][symbol] = {
+        "last_signal": signal, 
+        "decision_score": decision_score,
+        "current_price": current_price,
+        "funding_rate": funding_rate
+    }
 
     return signal, decision_score
 
-# --- 4. FUNCIONES DE EJECUCIÓN ---
+# --- 4. FUNCIONES DE EJECUCIÓN (SIN CAMBIOS EN ESTA VERSIÓN) ---
 
 def update_balances():
     """Actualiza los balances de USDT, BNB y de todos los activos vigilados."""
@@ -386,7 +433,7 @@ def bot_loop():
             
             # Bucle que procesa cada símbolo en la lista
             for symbol in SYMBOLS_LIST:
-                # 1. Obtener datos (Usa public_client)
+                # 1. Obtener datos (Usa public_client, ahora incluye Funding Rate)
                 df = get_data(symbol) 
                 if df is None:
                     print(f"⚠️ {symbol}: No se obtuvieron datos, saltando análisis para este par.")
@@ -394,9 +441,14 @@ def bot_loop():
 
                 # 2. Generar señal
                 signal, decision_score = get_signal(df, symbol)
-                current_price = df.iloc[-1]['close']
                 
-                print(f"📊 {symbol} | Señal: {signal} (Puntaje: {decision_score:.1f}) | Precio: {current_price:.4f}")
+                # Accede al estado para obtener los datos de la última ejecución
+                symbol_data = bot_state["current_state"]["symbol_data"].get(symbol, {})
+                current_price = symbol_data.get("current_price", df.iloc[-1]['close'])
+                funding_rate = symbol_data.get("funding_rate", 0.0)
+
+
+                print(f"📊 {symbol} | Señal: {signal} (Puntaje: {decision_score:.1f}) | Precio: {current_price:.4f} | Funding Rate: {funding_rate:.5f}")
                 
                 # 3. Ejecutar orden
                 if signal != "HOLD":
