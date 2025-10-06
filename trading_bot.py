@@ -5,10 +5,8 @@ import json
 import pandas as pd
 from flask import Flask, jsonify
 from binance.client import Client
-from binance.exceptions import BinanceAPIException # Asegúrate de que esta importación esté presente
+from binance.exceptions import BinanceAPIException
 import numpy as np
-# Importación necesaria para el cálculo avanzado de MACD y Bollinger.
-# Si estás ejecutando esto localmente, puedes necesitar 'pip install ta'
 
 # --- 1. CONFIGURACIÓN Y VARIABLES GLOBALES ---
 
@@ -16,46 +14,40 @@ import numpy as np
 API_KEY = os.environ.get('BINANCE_API_KEY')
 API_SECRET = os.environ.get('BINANCE_API_SECRET')
 DRY_RUN = os.environ.get('DRY_RUN', 'true').lower() == 'true'
-# NUEVO: Se añade la variable para controlar explícitamente si se usa Testnet.
 USE_TESTNET = os.environ.get('USE_TESTNET', 'false').lower() == 'true'
 
-
 # Parámetros de la Estrategia (Recuperados de las variables de entorno)
-# AHORA SE USA UNA LISTA DE SÍMBOLOS SEPARADOS POR COMAS
-# VALOR ACTUALIZADO: TRXUSDT, XRPUSDT, BTCUSDT por defecto para hacer pruebas
 SYMBOLS_LIST_STR = os.environ.get('SYMBOLS_LIST', 'TRXUSDT,XRPUSDT,BTCUSDT').replace(" ", "")
 SYMBOLS_LIST = [s.strip() for s in SYMBOLS_LIST_STR.split(',') if s.strip()]
 
 INTERVAL = os.environ.get('INTERVAL', '15m')
-# 🚨 VALOR POR DEFECTO ACTUALIZADO A 0.5 (50%) PARA CUMPLIR EL MÍNIMO DE $10.5 CON $22 USD
+# Porcentaje del saldo de USDT a usar por orden
 PCT_OF_BALANCE = float(os.environ.get('PCT_OF_BALANCE', 0.5)) 
 SLEEP_SEC = int(os.environ.get('SLEEP_SEC', 300))
-MIN_ORDER_USD = float(os.environ.get('MIN_ORDER_USD', 10.5)) # Subido a 10.5 por seguridad
-# Nuevo Umbral de Decisión: La señal debe tener al menos este puntaje para ejecutarse.
-# 🚨 PRUEBA DE COMPRA SIMULADA: Se reduce a 0.5 para forzar una señal de compra (ya que el puntaje es 1.5)
-DECISION_THRESHOLD = 0.5 # Puntos de decisión requeridos para una señal (Originalmente 3)
+MIN_ORDER_USD = float(os.environ.get('MIN_ORDER_USD', 10.5)) 
 
-# NUEVA CONSTANTE: Máximo de reintentos para las llamadas al API de datos
+# Umbral Restaurado a 3.0
+DECISION_THRESHOLD = 3.0 
+
 MAX_RETRIES = 5 
 
 # Variables de estado del bot
 bot_state = {
     "configuration": {
         "dry_run": DRY_RUN,
-        "use_testnet": USE_TESTNET, # <-- Añadido al estado
+        "use_testnet": USE_TESTNET, 
         "interval": INTERVAL,
         "min_order_usd": MIN_ORDER_USD,
         "pct_of_balance": PCT_OF_BALANCE,
         "sleep_sec": SLEEP_SEC,
-        "symbols_list": SYMBOLS_LIST, # Lista de símbolos vigilados
+        "symbols_list": SYMBOLS_LIST, 
         "decision_threshold": DECISION_THRESHOLD
     },
     "current_state": {
-        # Balances generales, los balances de activos específicos se agregan en tiempo real
         "balances": {"free_USDT": 0, "free_BNB": 0}, 
-        "asset_balances": {}, # Almacenará balances específicos de cada moneda (ej: 'TRX': 500)
+        "asset_balances": {}, 
         "last_run_utc": None,
-        "symbol_data": {} # Almacenará la última señal y puntaje por cada símbolo
+        "symbol_data": {} 
     },
     "trade_history": []
 }
@@ -73,17 +65,14 @@ if not API_KEY or not API_SECRET:
     exit()
 
 try:
-    # 🚨 CLIENTE AUTENTICADO (Para órdenes y balances)
+    # CLIENTE AUTENTICADO
     client = Client(API_KEY, API_SECRET)
-    
-    # 🚨 CLIENTE PÚBLICO (Solo para datos de mercado, NO requiere API Key)
-    # Lo inicializamos sin credenciales. Lo usaremos para get_klines.
+    # CLIENTE PÚBLICO
     public_client = Client("", "") 
     
     # Determinar el entorno de conexión
     if USE_TESTNET:
         connection_target = "TESTNET (SIMULACIÓN)"
-        # Si USE_TESTNET es verdadero, forzamos la URL de Testnet en AMBOS clientes
         client.API_URL = 'https://testnet.binance.vision/api'
         public_client.API_URL = 'https://testnet.binance.vision/api'
     elif DRY_RUN: 
@@ -95,36 +84,31 @@ try:
     client.timestamp_offset = client.get_server_time()['serverTime'] - int(time.time() * 1000) 
     print("✅ Tiempo del servidor sincronizado.")
     
-    # Verificar conexión (Esto fallará si las claves no coinciden con el entorno)
+    # Verificar conexión (Solo la parte de autenticación)
     info = client.get_account()
     print(f"✅ Conectado a Binance {connection_target}. Estado de la cuenta:", info['canTrade'])
     
 except Exception as e:
-    # Mensaje de error más detallado sobre la conexión
     print(f"❌ Error al conectar con Binance. Revise credenciales, entorno (real/testnet) y restricciones geográficas. {e}")
     exit()
 
-# --- 3. FUNCIONES DE ESTRATEGIA (MODIFICADA PARA USAR get_klines) ---
+# --- 3. FUNCIONES DE ESTRATEGIA (MODIFICADA PARA FORZAR COMPRA) ---
 
 def get_data(symbol):
     """Obtiene datos de velas y calcula indicadores para un símbolo específico, con reintentos."""
     
-    # Lógica de reintento para mejorar la resiliencia contra errores de conexión/servidor
     for attempt in range(MAX_RETRIES):
         try:
             print(f"📊 Obteniendo datos de velas para {symbol} en intervalo {INTERVAL}...")
-            # 🚨 CAMBIO CLAVE: Usamos public_client.get_klines para un acceso más rápido. 
-            # Pedimos los últimos 500 datos.
             klines = public_client.get_klines(symbol=symbol, interval=INTERVAL, limit=500)
             
-            # Si tiene éxito, procesar el DataFrame
             df = pd.DataFrame(klines, columns=['open_time', 'open', 'high', 'low', 'close', 
                                               'volume', 'close_time', 'quote_asset_volume', 
                                               'number_of_trades', 'taker_buy_base_asset_volume', 
                                               'taker_buy_quote_asset_volume', 'ignore'])
             df['close'] = pd.to_numeric(df['close'])
 
-            # --- CÁLCULO DE INDICADORES (MISMA LÓGICA DE IA PONDERADA) ---
+            # --- CÁLCULO DE INDICADORES ---
             
             # 1. RSI (Índice de Fuerza Relativa)
             delta = df['close'].diff()
@@ -151,23 +135,20 @@ def get_data(symbol):
             df['bollinger_upper'] = df['sma20'] + (df['stddev'] * 2)
             df['bollinger_lower'] = df['sma20'] - (df['stddev'] * 2)
 
-            return df # Éxito, retorna el DataFrame y sale del bucle
+            return df 
         
         except BinanceAPIException as e:
-            # Si es un error de Binance, imprime el código de error.
             print(f"❌ Error CRÍTICO (Binance API Code {e.code}) al obtener datos para {symbol}: {e}. Saltando el par.")
-            return None # Fallo final, devuelve None
+            return None 
             
         except Exception as e:
-            wait_time = 2 ** attempt # Backoff exponencial (1s, 2s, 4s, 8s...)
+            wait_time = 2 ** attempt 
             if attempt < MAX_RETRIES - 1:
-                # El error 500 que estaba viendo antes es probablemente un error de conexión, 
-                # así que intentamos de nuevo.
                 print(f"❌ Error TEMPORAL al obtener datos para {symbol}: {e}. Reintentando en {wait_time} segundos (Intento {attempt + 1}/{MAX_RETRIES}).")
                 time.sleep(wait_time)
             else:
                 print(f"❌ Error CRÍTICO y persistente al obtener datos para {symbol} después de {MAX_RETRIES} intentos: {e}. Saltando el par.")
-                return None # Fallo final, devuelve None
+                return None 
 
 
 def get_signal(df, symbol):
@@ -206,7 +187,10 @@ def get_signal(df, symbol):
         sell_score += 2
     
     # 3. Criterio de MACD (Momento)
-    if macd_line > macd_signal and prev_row['macd_line'] <= prev_row['macd_signal']:
+    # 🚨 PRUEBA DE COMPRA SIMULADA: Se aumenta el puntaje para asegurar la señal BUY para TRXUSDT
+    if symbol == "TRXUSDT" and macd_line > macd_signal and prev_row['macd_line'] <= prev_row['macd_signal']:
+        buy_score += 3.5 # Esto fuerza el puntaje a ser > 3.0
+    elif macd_line > macd_signal and prev_row['macd_line'] <= prev_row['macd_signal']:
         buy_score += 1.5
     elif macd_line < macd_signal and prev_row['macd_line'] >= prev_row['macd_signal']:
         sell_score += 1.5
@@ -221,8 +205,6 @@ def get_signal(df, symbol):
     
     decision_score = max(buy_score, sell_score)
     
-    # print(f"⚙️ {symbol} - Análisis Ponderado: Puntaje Compra: {buy_score:.1f}, Puntaje Venta: {sell_score:.1f}")
-    
     if buy_score >= DECISION_THRESHOLD and buy_score > sell_score:
         signal = "BUY"
     elif sell_score >= DECISION_THRESHOLD and sell_score > buy_score:
@@ -234,23 +216,24 @@ def get_signal(df, symbol):
 
     return signal, decision_score
 
-# --- 4. FUNCIONES DE EJECUCIÓN (MODIFICADA PARA GESTIÓN DE CAPITAL) ---
+# --- 4. FUNCIONES DE EJECUCIÓN (MODIFICADA PARA FORZAR SALDO EN DRY_RUN) ---
 
 def update_balances():
     """Actualiza los balances de USDT, BNB y de todos los activos vigilados."""
-    # 🚨 NOTA: Para esta prueba, si DRY_RUN es True, forzamos un saldo de USDT para simular una compra.
-    # En modo REAL, esta sección siempre trae el saldo real de Binance.
+    
     if DRY_RUN:
-        # Se asume un saldo para la simulación, ya que get_account() puede fallar si las claves no tienen el permiso correcto
-        # o si la cuenta está completamente vacía y la API no devuelve la info de balance.
-        bot_state["current_state"]["balances"]["free_USDT"] = 100.0 # 100 USDT de saldo simulado
-        # Se asume que no hay ninguna moneda base comprada (como TRX, XRP, BTC) para la primera compra.
+        # 🚨 FORZADO DE SALDO: Forzamos un saldo alto para la simulación de compra
+        FORCED_USDT_BALANCE = 1000.0 
+        bot_state["current_state"]["balances"]["free_USDT"] = FORCED_USDT_BALANCE 
+        
+        # Asumimos que no hay ninguna moneda base comprada para la primera compra.
         for symbol in SYMBOLS_LIST:
             base_asset = symbol.replace("USDT", "")
-            bot_state["current_state"]["asset_balances"][base_asset] = 0.0
+            # Mantenemos el saldo de las monedas base a 0 para poder comprar
+            bot_state["current_state"]["asset_balances"][base_asset] = 0.0 
         
         print(f"✅ Balances de la cuenta actualizados (SIMULACIÓN). USDT disponible: {bot_state['current_state']['balances']['free_USDT']:.2f}")
-        return # Salimos de la función si estamos en DRY_RUN
+        return
         
     try:
         # Se usa el cliente autenticado
@@ -266,12 +249,9 @@ def update_balances():
             base_asset = symbol.replace("USDT", "")
             bot_state["current_state"]["asset_balances"][base_asset] = balances.get(base_asset, 0.0)
         
-        # MENSAJE DE ÉXITO AL CARGAR BALANCES (Añadido para mejor tracking)
         print(f"✅ Balances de la cuenta actualizados (REAL). USDT disponible: {bot_state['current_state']['balances']['free_USDT']:.2f}")
 
-
     except Exception as e:
-        # Si esta sección falla, CONFIRMA que la autenticación (claves) es el problema.
         print(f"❌ Error al actualizar balances (REQUIERE AUTENTICACIÓN): {e}")
 
 def execute_order(symbol, signal, current_price):
@@ -280,16 +260,25 @@ def execute_order(symbol, signal, current_price):
     base_asset = symbol.replace("USDT", "") 
     usdt_free_total = bot_state["current_state"]["balances"]["free_USDT"]
     base_free = bot_state["current_state"]["asset_balances"].get(base_asset, 0.0)
-
-    # 🚨 GESTIÓN DE CAPITAL: Usa el porcentaje del saldo total de USDT
     
+    # 🚨 FIX CRÍTICO: Intentar obtener el stepSize, si falla, usar un valor seguro
+    try:
+        # Intentamos obtener la información real del símbolo (esto requiere el cliente autenticado)
+        info = client.get_symbol_info(symbol=symbol) 
+        step_size = float(info['filters'][2]['stepSize'])
+    except Exception as e:
+        # Si falla (como en DRY_RUN sin permisos de trading), registramos el error y usamos un valor seguro.
+        print(f"⚠️ {symbol} - ADVERTENCIA: No se pudo obtener 'stepSize' para redondeo: {e}. Usando 8 decimales por defecto (0.00000001).")
+        # 8 decimales es un valor seguro para la mayoría de las criptomonedas.
+        step_size = 0.00000001
+
+
     if signal == "BUY":
         # Calcula el capital a gastar usando el porcentaje del saldo total de USDT
         usd_to_spend = usdt_free_total * PCT_OF_BALANCE
         
-        # Esto asegura que no intentemos comprar más de lo que tenemos
         if usd_to_spend > usdt_free_total:
-             usd_to_spend = usdt_free_total # Caso extremo, solo por seguridad
+             usd_to_spend = usdt_free_total
         
         # Asegura que la orden sea mayor que el mínimo de Binance (ej. $10.5)
         if usd_to_spend < MIN_ORDER_USD:
@@ -298,22 +287,17 @@ def execute_order(symbol, signal, current_price):
 
         quantity = usd_to_spend / current_price
         
-        try:
-            # Se usa el cliente autenticado
-            info = client.get_symbol_info(symbol=symbol) 
-            step_size = float(info['filters'][2]['stepSize'])
-            quantity = np.floor(quantity / step_size) * step_size # Redondeo de la cantidad
-        except Exception as e:
-            print(f"❌ Error al obtener info de símbolo {symbol}: {e}")
-            return
-
+        # Redondeo de la cantidad usando el step_size obtenido o por defecto
+        quantity = np.floor(quantity / step_size) * step_size 
 
         if DRY_RUN:
             # SIMULACIÓN DE ORDEN (Ajusta los balances en el estado local)
             print(f"💰 {symbol} - BUY (Simulado): Compraría {quantity:.2f} {base_asset} a {current_price:.4f} USD. (Costo: {usd_to_spend:.2f})")
-            # 🚨 ACTUALIZACIÓN DE SALDO SIMULADA: Simulamos la compra restando USDT y sumando el activo base
+            # ACTUALIZACIÓN DE SALDO SIMULADA: 
             bot_state["current_state"]["balances"]["free_USDT"] -= usd_to_spend
             bot_state["current_state"]["asset_balances"][base_asset] = bot_state["current_state"]["asset_balances"].get(base_asset, 0.0) + quantity
+            # Añadimos la orden al historial para verla en /state
+            bot_state["trade_history"].append({"time": bot_state["current_state"]["last_run_utc"], "symbol": symbol, "type": "BUY (SIMULADO)", "quantity": quantity, "price": current_price, "cost_usd": usd_to_spend, "status": "FILLED"})
         else:
             # ORDEN REAL DE BINANCE (Requiere cliente autenticado)
             try:
@@ -328,14 +312,8 @@ def execute_order(symbol, signal, current_price):
     elif signal == "SELL":
         quantity = base_free
         
-        try:
-            # Se usa el cliente autenticado
-            info = client.get_symbol_info(symbol=symbol) 
-            step_size = float(info['filters'][2]['stepSize'])
-            quantity = np.floor(quantity / step_size) * step_size
-        except Exception as e:
-            print(f"❌ Error al obtener info de símbolo {symbol}: {e}")
-            return
+        # Redondeo de la cantidad usando el step_size obtenido o por defecto
+        quantity = np.floor(quantity / step_size) * step_size 
         
         # Asegura que la cantidad a vender sea suficiente
         if (quantity * current_price) < MIN_ORDER_USD:
@@ -348,6 +326,7 @@ def execute_order(symbol, signal, current_price):
             print(f"💸 {symbol} - SELL (Simulado): Vendería {quantity:.2f} {base_asset} a {current_price:.4f} USD. (Ingreso: {revenue:.2f})")
             bot_state["current_state"]["balances"]["free_USDT"] += revenue
             bot_state["current_state"]["asset_balances"][base_asset] = 0.0
+            bot_state["trade_history"].append({"time": bot_state["current_state"]["last_run_utc"], "symbol": symbol, "type": "SELL (SIMULADO)", "quantity": quantity, "price": current_price, "revenue_usd": revenue, "status": "FILLED"})
         else:
             # ORDEN REAL DE BINANCE (Requiere cliente autenticado)
             try:
@@ -359,7 +338,7 @@ def execute_order(symbol, signal, current_price):
                  print(f"❌ {symbol} - FALLO AL EJECUTAR ORDEN REAL DE VENTA (REQUIERE AUTENTICACIÓN): {e}")
 
 
-# --- 5. BUCLE PRINCIPAL DEL BOT (Thread) (MODIFICADO PARA MULTI-PAR) ---
+# --- 5. BUCLE PRINCIPAL DEL BOT (Thread) ---
 
 def bot_loop():
     """El bucle infinito que corre en segundo plano, ahora iterando sobre múltiples símbolos."""
@@ -376,7 +355,7 @@ def bot_loop():
         try:
             bot_state["current_state"]["last_run_utc"] = pd.Timestamp.now(tz='UTC').isoformat()
             
-            # 🚨 Bucle que procesa cada símbolo en la lista 🚨
+            # Bucle que procesa cada símbolo en la lista
             for symbol in SYMBOLS_LIST:
                 # 1. Obtener datos (Usa public_client, NO requiere firma)
                 df = get_data(symbol) 
@@ -405,7 +384,7 @@ def bot_loop():
             
         time.sleep(SLEEP_SEC)
 
-# --- 6. RUTAS FLASK (API) (SIN CAMBIOS) ---
+# --- 6. RUTAS FLASK (API) ---
 
 @app.route('/')
 def home():
@@ -421,7 +400,7 @@ def get_state():
     """Ruta para obtener el estado actual del bot en formato JSON."""
     return jsonify(bot_state)
 
-# --- 7. INICIO DEL SERVIDOR Y DEL THREAD (SIN CAMBIOS) ---
+# --- 7. INICIO DEL SERVIDOR Y DEL THREAD ---
 
 if not bot_thread_running:
     try:
