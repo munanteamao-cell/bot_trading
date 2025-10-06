@@ -26,8 +26,8 @@ PCT_OF_BALANCE = float(os.environ.get('PCT_OF_BALANCE', 0.5))
 SLEEP_SEC = int(os.environ.get('SLEEP_SEC', 300))
 MIN_ORDER_USD = float(os.environ.get('MIN_ORDER_USD', 10.5)) 
 
-# Umbral de decisión (mantener en 3.0 para la prueba)
-DECISION_THRESHOLD = 3.0 
+# Umbral de decisión: Aumentado de 3.0 a 2.0 para mayor sensibilidad en la simulación
+DECISION_THRESHOLD = 2.0 
 
 MAX_RETRIES = 5 
 
@@ -200,40 +200,37 @@ def get_signal(df, symbol):
     buy_score = 0
     sell_score = 0
     
-    # 1. Criterio de RSI (Impulso)
+    # 1. Criterio de RSI (Impulso: Comprar si es bajo <40, Vender si es alto >60)
     if rsi < 40:
         buy_score += 1
     elif rsi > 60:
         sell_score += 1
 
-    # 2. Criterio de Crossover EMA (Tendencia)
+    # 2. Criterio de Crossover EMA (Tendencia: EMA corta cruza a EMA larga)
     if ema9 > ema21 and prev_row['ema9'] <= prev_row['ema21']:
         buy_score += 2
     elif ema9 < ema21 and prev_row['ema9'] >= prev_row['ema21']:
         sell_score += 2
     
-    # 3. Criterio de MACD (Momento)
+    # 3. Criterio de MACD (Momento: MACD cruza la línea de señal)
     if macd_line > macd_signal and prev_row['macd_line'] <= prev_row['macd_signal']:
         buy_score += 1.5
     elif macd_line < macd_signal and prev_row['macd_line'] >= prev_row['macd_signal']:
         sell_score += 1.5
 
-    # 4. Criterio de Bandas de Bollinger (Volatilidad y Extremo)
+    # 4. Criterio de Bandas de Bollinger (Volatilidad y Extremo: Comprar en la banda inferior, Vender en la superior)
     if current_price < bollinger_lower:
         buy_score += 1
     elif current_price > bollinger_upper:
         sell_score += 1
 
-    # 🚨 FIX CRÍTICO para asegurar la primera compra simulada
-    # Solo aplicamos el puntaje extra si el historial de trades está vacío (primera ejecución)
-    if symbol == "TRXUSDT" and not bot_state["trade_history"]:
-        buy_score += 3.5 
-        print("🚨 Forzando la señal de COMPRA para TRXUSDT en el primer ciclo de simulación.")
+    # 🚨 NOTA: Se eliminó el puntaje de compra forzado para que el bot decida con la lógica ajustada (Umbral de 2.0).
 
     # --- EVALUACIÓN DE LA DECISIÓN ---
     
     decision_score = max(buy_score, sell_score)
     
+    # La señal se activa si el puntaje supera o iguala el umbral (2.0)
     if buy_score >= DECISION_THRESHOLD and buy_score > sell_score:
         signal = "BUY"
     elif sell_score >= DECISION_THRESHOLD and sell_score > buy_score:
@@ -252,12 +249,12 @@ def update_balances():
     
     if DRY_RUN:
         # Lógica de saldo simulado
-        # Si no hay historial de trades, inicializamos a 1000 USDT. Si ya hay trades, mantenemos el saldo simulado.
         initial_usdt = 1000.0
-        if not bot_state["trade_history"]:
+        # Solo inicializa el saldo a 1000 si no hay historial de trades, si no, usa el saldo actual simulado.
+        if not bot_state["trade_history"] and bot_state["current_state"]["balances"]["free_USDT"] == 0.0:
             bot_state["current_state"]["balances"]["free_USDT"] = initial_usdt
         
-        # Mantenemos los saldos de las monedas base intactos si ya se compró
+        # Inicializa los saldos de las monedas base
         for symbol in SYMBOLS_LIST:
             base_asset = symbol.replace("USDT", "")
             if base_asset not in bot_state["current_state"]["asset_balances"]:
