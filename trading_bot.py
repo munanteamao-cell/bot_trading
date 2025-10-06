@@ -22,8 +22,8 @@ USE_TESTNET = os.environ.get('USE_TESTNET', 'false').lower() == 'true'
 
 # Parámetros de la Estrategia (Recuperados de las variables de entorno)
 # AHORA SE USA UNA LISTA DE SÍMBOLOS SEPARADOS POR COMAS
-# VALOR ACTUALIZADO: TRXUSDT y XRPUSDT por defecto
-SYMBOLS_LIST_STR = os.environ.get('SYMBOLS_LIST', 'TRXUSDT,XRPUSDT').replace(" ", "")
+# VALOR ACTUALIZADO: TRXUSDT, XRPUSDT, BTCUSDT por defecto para hacer pruebas
+SYMBOLS_LIST_STR = os.environ.get('SYMBOLS_LIST', 'TRXUSDT,XRPUSDT,BTCUSDT').replace(" ", "")
 SYMBOLS_LIST = [s.strip() for s in SYMBOLS_LIST_STR.split(',') if s.strip()]
 
 INTERVAL = os.environ.get('INTERVAL', '15m')
@@ -85,6 +85,10 @@ try:
         # Si es DRY_RUN pero no es Testnet, usamos el API de producción solo para leer datos.
     else:
         connection_target = "PRODUCCIÓN (DINERO REAL)"
+
+    # 🚨 NUEVA LÍNEA: Sincronizar el tiempo del cliente con el servidor de Binance
+    client.timestamp_offset = client.get_server_time()['serverTime'] - int(time.time() * 1000) 
+    print("✅ Tiempo del servidor sincronizado.")
     
     # Verificar conexión (Esto fallará si las claves no coinciden con el entorno)
     info = client.get_account()
