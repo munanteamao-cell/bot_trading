@@ -76,7 +76,7 @@ try:
     client = Client(API_KEY, API_SECRET)
     
     # 🚨 CLIENTE PÚBLICO (Solo para datos de mercado, NO requiere API Key)
-    # Lo inicializamos sin credenciales. Lo usaremos para get_historical_klines
+    # Lo inicializamos sin credenciales. Lo usaremos para get_klines.
     public_client = Client("", "") 
     
     # Determinar el entorno de conexión
@@ -103,7 +103,7 @@ except Exception as e:
     print(f"❌ Error al conectar con Binance. Revise credenciales, entorno (real/testnet) y restricciones geográficas. {e}")
     exit()
 
-# --- 3. FUNCIONES DE ESTRATEGIA (MODIFICADA PARA USAR public_client) ---
+# --- 3. FUNCIONES DE ESTRATEGIA (MODIFICADA PARA USAR get_klines) ---
 
 def get_data(symbol):
     """Obtiene datos de velas y calcula indicadores para un símbolo específico, con reintentos."""
@@ -112,8 +112,9 @@ def get_data(symbol):
     for attempt in range(MAX_RETRIES):
         try:
             print(f"📊 Obteniendo datos de velas para {symbol} en intervalo {INTERVAL}...")
-            # 🚨 CAMBIO CLAVE: Usamos public_client para obtener klines. ESTO NO REQUIERE AUTENTICACIÓN.
-            klines = public_client.get_historical_klines(symbol, INTERVAL, "500 ago UTC")
+            # 🚨 CAMBIO CLAVE: Usamos public_client.get_klines para un acceso más rápido. 
+            # Pedimos los últimos 500 datos.
+            klines = public_client.get_klines(symbol=symbol, interval=INTERVAL, limit=500)
             
             # Si tiene éxito, procesar el DataFrame
             df = pd.DataFrame(klines, columns=['open_time', 'open', 'high', 'low', 'close', 
@@ -159,6 +160,8 @@ def get_data(symbol):
         except Exception as e:
             wait_time = 2 ** attempt # Backoff exponencial (1s, 2s, 4s, 8s...)
             if attempt < MAX_RETRIES - 1:
+                # El error 500 que estaba viendo antes es probablemente un error de conexión, 
+                # así que intentamos de nuevo.
                 print(f"❌ Error TEMPORAL al obtener datos para {symbol}: {e}. Reintentando en {wait_time} segundos (Intento {attempt + 1}/{MAX_RETRIES}).")
                 time.sleep(wait_time)
             else:
@@ -247,6 +250,10 @@ def update_balances():
         for symbol in SYMBOLS_LIST:
             base_asset = symbol.replace("USDT", "")
             bot_state["current_state"]["asset_balances"][base_asset] = balances.get(base_asset, 0.0)
+        
+        # MENSAJE DE ÉXITO AL CARGAR BALANCES (Añadido para mejor tracking)
+        print(f"✅ Balances de la cuenta actualizados. USDT disponible: {bot_state['current_state']['balances']['free_USDT']:.2f}")
+
 
     except Exception as e:
         # Si esta sección falla, CONFIRMA que la autenticación (claves) es el problema.
