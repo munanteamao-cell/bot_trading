@@ -20,14 +20,15 @@ USE_TESTNET = os.environ.get('USE_TESTNET', 'false').lower() == 'true'
 SYMBOLS_LIST_STR = os.environ.get('SYMBOLS_LIST', 'TRXUSDT,XRPUSDT,BTCUSDT').replace(" ", "")
 SYMBOLS_LIST = [s.strip() for s in SYMBOLS_LIST_STR.split(',') if s.strip()]
 
-INTERVAL = os.environ.get('INTERVAL', '15m')
+# *** CAMBIO AQUÍ: Usamos 5m si no se especifica. Debe ajustarlo en Render. ***
+INTERVAL = os.environ.get('INTERVAL', '5m')
 # Porcentaje del saldo de USDT a usar por orden
 PCT_OF_BALANCE = float(os.environ.get('PCT_OF_BALANCE', 0.5)) 
 SLEEP_SEC = int(os.environ.get('SLEEP_SEC', 300))
 MIN_ORDER_USD = float(os.environ.get('MIN_ORDER_USD', 10.5)) 
 
-# Umbral de decisión: Aumentado de 3.0 a 2.0 para mayor sensibilidad en la simulación
-DECISION_THRESHOLD = 2.0 
+# *** Usamos el DECISION_THRESHOLD que tenga configurado en Render (ej. 3.0) ***
+DECISION_THRESHOLD = float(os.environ.get('DECISION_THRESHOLD', 3.0)) 
 
 MAX_RETRIES = 5 
 
@@ -126,6 +127,7 @@ def get_data(symbol):
     for attempt in range(MAX_RETRIES):
         try:
             print(f"📊 Obteniendo datos de velas para {symbol} en intervalo {INTERVAL}...")
+            # Limit 500 es suficiente para calcular todos los indicadores
             klines = public_client.get_klines(symbol=symbol, interval=INTERVAL, limit=500)
             
             df = pd.DataFrame(klines, columns=['open_time', 'open', 'high', 'low', 'close', 
@@ -140,6 +142,7 @@ def get_data(symbol):
             delta = df['close'].diff()
             gain = delta.where(delta > 0, 0)
             loss = -delta.where(delta < 0, 0)
+            # Período estándar de 14, usando com=13
             avg_gain = gain.ewm(com=13, adjust=False).mean()
             avg_loss = loss.ewm(com=13, adjust=False).mean()
             rs = avg_gain / avg_loss
@@ -202,15 +205,15 @@ def get_signal(df, symbol):
     
     # 1. Criterio de RSI (Impulso: Comprar si es bajo <40, Vender si es alto >60)
     if rsi < 40:
-        buy_score += 1
+        buy_score += 1.0
     elif rsi > 60:
-        sell_score += 1
+        sell_score += 1.0
 
     # 2. Criterio de Crossover EMA (Tendencia: EMA corta cruza a EMA larga)
     if ema9 > ema21 and prev_row['ema9'] <= prev_row['ema21']:
-        buy_score += 2
+        buy_score += 2.0
     elif ema9 < ema21 and prev_row['ema9'] >= prev_row['ema21']:
-        sell_score += 2
+        sell_score += 2.0
     
     # 3. Criterio de MACD (Momento: MACD cruza la línea de señal)
     if macd_line > macd_signal and prev_row['macd_line'] <= prev_row['macd_signal']:
@@ -220,17 +223,15 @@ def get_signal(df, symbol):
 
     # 4. Criterio de Bandas de Bollinger (Volatilidad y Extremo: Comprar en la banda inferior, Vender en la superior)
     if current_price < bollinger_lower:
-        buy_score += 1
+        buy_score += 1.0
     elif current_price > bollinger_upper:
-        sell_score += 1
-
-    # 🚨 NOTA: Se eliminó el puntaje de compra forzado para que el bot decida con la lógica ajustada (Umbral de 2.0).
+        sell_score += 1.0
 
     # --- EVALUACIÓN DE LA DECISIÓN ---
     
     decision_score = max(buy_score, sell_score)
     
-    # La señal se activa si el puntaje supera o iguala el umbral (2.0)
+    # La señal se activa si el puntaje supera o iguala el umbral
     if buy_score >= DECISION_THRESHOLD and buy_score > sell_score:
         signal = "BUY"
     elif sell_score >= DECISION_THRESHOLD and sell_score > buy_score:
@@ -289,7 +290,7 @@ def execute_order(symbol, signal, current_price):
     usdt_free_total = bot_state["current_state"]["balances"]["free_USDT"]
     base_free = bot_state["current_state"]["asset_balances"].get(base_asset, 0.0)
     
-    # Obtener el tamaño de paso (stepSize) usando la nueva función PÚBLICA
+    # Obtener el tamaño de paso (stepSize)
     step_size = get_symbol_step_size(symbol)
 
     if signal == "BUY":
@@ -302,8 +303,11 @@ def execute_order(symbol, signal, current_price):
         
         # Asegura que la orden sea mayor que el mínimo de Binance (ej. $10.5)
         if usd_to_spend < MIN_ORDER_USD:
-            print(f"⚠️ {symbol} - COMPRA: Saldo insuficiente o bajo para orden de {MIN_ORDER_USD} USD. (Disponible: {usdt_free_total:.2f})")
-            return
+            # Si el saldo es bajo, el bot no puede comprar
+            if usdt_free_total < MIN_ORDER_USD:
+                 return
+            # Si el monto calculado es menor al mínimo, usamos el mínimo si el saldo lo permite
+            usd_to_spend = MIN_ORDER_USD
 
         quantity = usd_to_spend / current_price
         
@@ -330,19 +334,24 @@ def execute_order(symbol, signal, current_price):
 
 
     elif signal == "SELL":
+        # Solo vende si tiene algo de esa moneda
+        if base_free <= 0:
+            return
+            
         quantity = base_free
         
         # Redondeo de la cantidad usando el step_size obtenido
         quantity = np.floor(quantity / step_size) * step_size 
         
-        # Asegura que la cantidad a vender sea suficiente
-        if (quantity * current_price) < MIN_ORDER_USD:
-            print(f"⚠️ {symbol} - VENTA: Saldo de {base_asset} es muy bajo para vender. (Valor: {quantity * current_price:.2f} USD)")
+        revenue = quantity * current_price
+        
+        # Asegura que la cantidad a vender sea suficiente para el mínimo
+        if revenue < MIN_ORDER_USD:
+            print(f"⚠️ {symbol} - VENTA: Saldo de {base_asset} es muy bajo para vender. (Valor: {revenue:.2f} USD)")
             return
             
         if DRY_RUN:
             # SIMULACIÓN DE ORDEN
-            revenue = quantity * current_price
             print(f"💸 {symbol} - SELL (Simulado): Vendería {quantity:.2f} {base_asset} a {current_price:.4f} USD. (Ingreso: {revenue:.2f})")
             bot_state["current_state"]["balances"]["free_USDT"] += revenue
             bot_state["current_state"]["asset_balances"][base_asset] = 0.0
@@ -391,7 +400,14 @@ def bot_loop():
                 
                 # 3. Ejecutar orden
                 if signal != "HOLD":
-                    execute_order(symbol, signal, current_price)
+                    # Solo COMPRA si tiene saldo de USDT
+                    if signal == "BUY" and bot_state["current_state"]["balances"]["free_USDT"] > 0:
+                        execute_order(symbol, signal, current_price)
+                    # Solo VENDE si tiene algo del activo base
+                    elif signal == "SELL" and bot_state["current_state"]["asset_balances"].get(symbol.replace("USDT", ""), 0.0) > 0:
+                        execute_order(symbol, signal, current_price)
+                    elif signal == "SELL" and bot_state["current_state"]["asset_balances"].get(symbol.replace("USDT", ""), 0.0) <= 0:
+                         print(f"❌ {symbol} - VENTA OMITIDA: No hay {symbol.replace('USDT', '')} en el balance simulado.")
                     
             # Actualizamos todos los balances al final del ciclo
             update_balances()
