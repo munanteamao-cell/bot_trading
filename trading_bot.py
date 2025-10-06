@@ -154,4 +154,239 @@ def get_data(symbol):
 
 
 def get_signal(df, symbol):
-# ... (rest of the function is the same)
+    """Genera la señal de trading para el símbolo usando lógica de puntaje."""
+    if df is None or len(df) < 50: 
+        bot_state["current_state"]["symbol_data"][symbol] = {"last_signal": "HOLD", "decision_score": 0}
+        return "HOLD", 0
+
+    last_row = df.iloc[-1]
+    prev_row = df.iloc[-2]
+
+    # --- DATOS DE ENTRADA AL MOTOR DE DECISIÓN ---
+    rsi = last_row['rsi']
+    ema9 = last_row['ema9']
+    ema21 = last_row['ema21']
+    macd_line = last_row['macd_line']
+    macd_signal = last_row['macd_signal']
+    current_price = last_row['close']
+    bollinger_upper = last_row['bollinger_upper']
+    bollinger_lower = last_row['bollinger_lower']
+
+    # --- LÓGICA DE PUNTAJE (SIMULACIÓN DE CLASIFICADOR) ---
+    buy_score = 0
+    sell_score = 0
+    
+    # 1. Criterio de RSI (Impulso)
+    if rsi < 40:
+        buy_score += 1
+    elif rsi > 60:
+        sell_score += 1
+
+    # 2. Criterio de Crossover EMA (Tendencia)
+    if ema9 > ema21 and prev_row['ema9'] <= prev_row['ema21']:
+        buy_score += 2
+    elif ema9 < ema21 and prev_row['ema9'] >= prev_row['ema21']:
+        sell_score += 2
+    
+    # 3. Criterio de MACD (Momento)
+    if macd_line > macd_signal and prev_row['macd_line'] <= prev_row['macd_signal']:
+        buy_score += 1.5
+    elif macd_line < macd_signal and prev_row['macd_line'] >= prev_row['macd_signal']:
+        sell_score += 1.5
+
+    # 4. Criterio de Bandas de Bollinger (Volatilidad y Extremo)
+    if current_price < bollinger_lower:
+        buy_score += 1
+    elif current_price > bollinger_upper:
+        sell_score += 1
+
+    # --- EVALUACIÓN DE LA DECISIÓN ---
+    
+    decision_score = max(buy_score, sell_score)
+    
+    # print(f"⚙️ {symbol} - Análisis Ponderado: Puntaje Compra: {buy_score:.1f}, Puntaje Venta: {sell_score:.1f}")
+    
+    if buy_score >= DECISION_THRESHOLD and buy_score > sell_score:
+        signal = "BUY"
+    elif sell_score >= DECISION_THRESHOLD and sell_score > buy_score:
+        signal = "SELL"
+    else:
+        signal = "HOLD"
+        
+    bot_state["current_state"]["symbol_data"][symbol] = {"last_signal": signal, "decision_score": decision_score}
+
+    return signal, decision_score
+
+# --- 4. FUNCIONES DE EJECUCIÓN (MODIFICADA PARA GESTIÓN DE CAPITAL) ---
+
+def update_balances():
+    """Actualiza los balances de USDT, BNB y de todos los activos vigilados."""
+    try:
+        account_info = client.get_account()
+        balances = {asset['asset']: float(asset['free']) for asset in account_info['balances']}
+
+        # 1. Actualizar saldos principales
+        bot_state["current_state"]["balances"]["free_USDT"] = balances.get('USDT', 0.0)
+        bot_state["current_state"]["balances"]["free_BNB"] = balances.get('BNB', 0.0)
+        
+        # 2. Actualizar saldos de activos base vigilados
+        for symbol in SYMBOLS_LIST:
+            base_asset = symbol.replace("USDT", "")
+            bot_state["current_state"]["asset_balances"][base_asset] = balances.get(base_asset, 0.0)
+
+    except Exception as e:
+        print(f"❌ Error al actualizar balances: {e}")
+
+def execute_order(symbol, signal, current_price):
+    """Ejecuta una orden de COMPRA o VENTA si DRY_RUN es False para un símbolo específico."""
+    
+    base_asset = symbol.replace("USDT", "") 
+    usdt_free_total = bot_state["current_state"]["balances"]["free_USDT"]
+    base_free = bot_state["current_state"]["asset_balances"].get(base_asset, 0.0)
+
+    # 🚨 GESTIÓN DE CAPITAL: Usa el porcentaje del saldo total de USDT
+    
+    if signal == "BUY":
+        # Calcula el capital a gastar usando el porcentaje del saldo total de USDT
+        usd_to_spend = usdt_free_total * PCT_OF_BALANCE
+        
+        # Esto asegura que no intentemos comprar más de lo que tenemos
+        if usd_to_spend > usdt_free_total:
+             usd_to_spend = usdt_free_total # Caso extremo, solo por seguridad
+        
+        # Asegura que la orden sea mayor que el mínimo de Binance (ej. $10.5)
+        if usd_to_spend < MIN_ORDER_USD:
+            print(f"⚠️ {symbol} - COMPRA: Saldo insuficiente o bajo para orden de {MIN_ORDER_USD} USD. (Disponible: {usdt_free_total:.2f})")
+            return
+
+        quantity = usd_to_spend / current_price
+        
+        try:
+            info = client.get_symbol_info(symbol=symbol)
+            step_size = float(info['filters'][2]['stepSize'])
+            quantity = np.floor(quantity / step_size) * step_size # Redondeo de la cantidad
+        except Exception as e:
+            print(f"❌ Error al obtener info de símbolo {symbol}: {e}")
+            return
+
+
+        if DRY_RUN:
+            # SIMULACIÓN DE ORDEN (Ajusta los balances en el estado local)
+            print(f"💰 {symbol} - BUY (Simulado): Compraría {quantity:.2f} {base_asset} a {current_price:.4f} USD. (Costo: {usd_to_spend:.2f})")
+            bot_state["current_state"]["balances"]["free_USDT"] -= usd_to_spend
+            bot_state["current_state"]["asset_balances"][base_asset] = bot_state["current_state"]["asset_balances"].get(base_asset, 0.0) + quantity
+        else:
+            # ORDEN REAL DE BINANCE
+            try:
+                print(f"💰 {symbol} - BUY (REAL): Enviando orden de mercado para comprar {quantity:.2f} {base_asset}...")
+                order = client.create_order(symbol=symbol, side='BUY', type='MARKET', quantity=quantity)
+                print(f"✅ {symbol} - Orden de COMPRA ejecutada. Status: {order['status']}")
+                bot_state["trade_history"].append({"time": bot_state["current_state"]["last_run_utc"], "symbol": symbol, "type": "BUY", "quantity": quantity, "price": current_price, "status": order['status']})
+            except Exception as e:
+                 print(f"❌ {symbol} - FALLO AL EJECUTAR ORDEN REAL DE COMPRA: {e}")
+
+
+    elif signal == "SELL":
+        quantity = base_free
+        
+        try:
+            info = client.get_symbol_info(symbol=symbol)
+            step_size = float(info['filters'][2]['stepSize'])
+            quantity = np.floor(quantity / step_size) * step_size
+        except Exception as e:
+            print(f"❌ Error al obtener info de símbolo {symbol}: {e}")
+            return
+        
+        # Asegura que la cantidad a vender sea suficiente
+        if (quantity * current_price) < MIN_ORDER_USD:
+            print(f"⚠️ {symbol} - VENTA: Saldo de {base_asset} es muy bajo para vender. (Valor: {quantity * current_price:.2f} USD)")
+            return
+            
+        if DRY_RUN:
+            # SIMULACIÓN DE ORDEN
+            revenue = quantity * current_price
+            print(f"💸 {symbol} - SELL (Simulado): Vendería {quantity:.2f} {base_asset} a {current_price:.4f} USD. (Ingreso: {revenue:.2f})")
+            bot_state["current_state"]["balances"]["free_USDT"] += revenue
+            bot_state["current_state"]["asset_balances"][base_asset] = 0.0
+        else:
+            # ORDEN REAL DE BINANCE
+            try:
+                print(f"💸 {symbol} - SELL (REAL): Enviando orden de mercado para vender {quantity:.2f} {base_asset}...")
+                order = client.create_order(symbol=symbol, side='SELL', type='MARKET', quantity=quantity)
+                print(f"✅ {symbol} - Orden de VENTA ejecutada. Status: {order['status']}")
+                bot_state["trade_history"].append({"time": bot_state["current_state"]["last_run_utc"], "symbol": symbol, "type": "SELL", "quantity": quantity, "price": current_price, "status": order['status']})
+            except Exception as e:
+                 print(f"❌ {symbol} - FALLO AL EJECUTAR ORDEN REAL DE VENTA: {e}")
+
+
+# --- 5. BUCLE PRINCIPAL DEL BOT (Thread) (MODIFICADO PARA MULTI-PAR) ---
+
+def bot_loop():
+    """El bucle infinito que corre en segundo plano, ahora iterando sobre múltiples símbolos."""
+    global bot_thread_running
+    bot_thread_running = True
+    
+    print(f"🤖 Bot iniciado en modo: {'DRY_RUN' if DRY_RUN else 'REAL'}.")
+    print(f"✅ Vigilando: {', '.join(SYMBOLS_LIST)}")
+    
+    update_balances()
+    print("✅ Balances iniciales cargados en el estado.")
+
+    while True:
+        try:
+            bot_state["current_state"]["last_run_utc"] = pd.Timestamp.now(tz='UTC').isoformat()
+            
+            # 🚨 Bucle que procesa cada símbolo en la lista 🚨
+            for symbol in SYMBOLS_LIST:
+                df = get_data(symbol)
+                if df is None:
+                    print(f"⚠️ {symbol}: No se obtuvieron datos, saltando análisis para este par.")
+                    continue
+
+                signal, decision_score = get_signal(df, symbol)
+                current_price = df.iloc[-1]['close']
+                
+                print(f"📊 {symbol} | Señal: {signal} (Puntaje: {decision_score:.1f}) | Precio: {current_price:.4f}")
+                
+                if signal != "HOLD":
+                    execute_order(symbol, signal, current_price)
+                    
+            # Actualizamos todos los balances al final del ciclo
+            update_balances()
+            print(f"🟢 Ciclo completado para todos los pares. Volviendo a dormir por {SLEEP_SEC} segundos.")
+
+        except BinanceAPIException as e:
+            print(f"❌ ERROR DE BINANCE (API): {e}")
+        except Exception as e:
+            print(f"❌ ERROR INESPERADO en el ciclo de trading: {e}")
+            
+        time.sleep(SLEEP_SEC)
+
+# --- 6. RUTAS FLASK (API) (SIN CAMBIOS) ---
+
+@app.route('/')
+def home():
+    """Ruta principal para verificar que el servicio está activo."""
+    return jsonify({
+        "status": "ok",
+        "message": f"Bot de Trading Activo. MODO: {'SIMULACIÓN' if DRY_RUN else 'REAL (RIESGO FINANCIERO)'}. Ver /state para detalles.",
+        "dry_run": DRY_RUN
+    })
+
+@app.route('/state')
+def get_state():
+    """Ruta para obtener el estado actual del bot en formato JSON."""
+    return jsonify(bot_state)
+
+# --- 7. INICIO DEL SERVIDOR Y DEL THREAD (SIN CAMBIOS) ---
+
+if not bot_thread_running:
+    try:
+        trading_thread = threading.Thread(target=bot_loop)
+        trading_thread.start()
+        print("🌐 Hilo de trading iniciado con éxito en segundo plano.")
+    except Exception as e:
+        print(f"❌ ERROR CRÍTICO: No se pudo iniciar el hilo de trading: {e}")
+
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=os.environ.get('PORT', 5000))
