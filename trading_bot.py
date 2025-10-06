@@ -5,7 +5,7 @@ import json
 import pandas as pd
 from flask import Flask, jsonify
 from binance.client import Client
-from binance.exceptions import BinanceAPIException
+from binance.exceptions import BinanceAPIException # Asegúrate de que esta importación esté presente
 import numpy as np
 # Importación necesaria para el cálculo avanzado de MACD y Bollinger.
 # Si estás ejecutando esto localmente, puedes necesitar 'pip install ta'
@@ -72,21 +72,25 @@ if not API_KEY or not API_SECRET:
     exit()
 
 try:
-    # Conexión al cliente de Binance
+    # 🚨 CLIENTE AUTENTICADO (Para órdenes y balances)
     client = Client(API_KEY, API_SECRET)
+    
+    # 🚨 CLIENTE PÚBLICO (Solo para datos de mercado, NO requiere API Key)
+    # Lo inicializamos sin credenciales. Lo usaremos para get_historical_klines
+    public_client = Client("", "") 
     
     # Determinar el entorno de conexión
     if USE_TESTNET:
         connection_target = "TESTNET (SIMULACIÓN)"
-        # Si USE_TESTNET es verdadero, forzamos la URL de Testnet
+        # Si USE_TESTNET es verdadero, forzamos la URL de Testnet en AMBOS clientes
         client.API_URL = 'https://testnet.binance.vision/api'
+        public_client.API_URL = 'https://testnet.binance.vision/api'
     elif DRY_RUN: 
         connection_target = "PRODUCCIÓN (SIMULACIÓN)"
-        # Si es DRY_RUN pero no es Testnet, usamos el API de producción solo para leer datos.
     else:
         connection_target = "PRODUCCIÓN (DINERO REAL)"
 
-    # 🚨 NUEVA LÍNEA: Sincronizar el tiempo del cliente con el servidor de Binance
+    # Sincronizar el tiempo del cliente con el servidor de Binance para el CLIENTE AUTENTICADO
     client.timestamp_offset = client.get_server_time()['serverTime'] - int(time.time() * 1000) 
     print("✅ Tiempo del servidor sincronizado.")
     
@@ -99,7 +103,7 @@ except Exception as e:
     print(f"❌ Error al conectar con Binance. Revise credenciales, entorno (real/testnet) y restricciones geográficas. {e}")
     exit()
 
-# --- 3. FUNCIONES DE ESTRATEGIA (MODIFICADA PARA ACEPTAR SYMBOL) ---
+# --- 3. FUNCIONES DE ESTRATEGIA (MODIFICADA PARA USAR public_client) ---
 
 def get_data(symbol):
     """Obtiene datos de velas y calcula indicadores para un símbolo específico, con reintentos."""
@@ -108,8 +112,8 @@ def get_data(symbol):
     for attempt in range(MAX_RETRIES):
         try:
             print(f"📊 Obteniendo datos de velas para {symbol} en intervalo {INTERVAL}...")
-            # Intento de obtener datos de velas
-            klines = client.get_historical_klines(symbol, INTERVAL, "500 ago UTC")
+            # 🚨 CAMBIO CLAVE: Usamos public_client para obtener klines. ESTO NO REQUIERE AUTENTICACIÓN.
+            klines = public_client.get_historical_klines(symbol, INTERVAL, "500 ago UTC")
             
             # Si tiene éxito, procesar el DataFrame
             df = pd.DataFrame(klines, columns=['open_time', 'open', 'high', 'low', 'close', 
@@ -146,6 +150,11 @@ def get_data(symbol):
             df['bollinger_lower'] = df['sma20'] - (df['stddev'] * 2)
 
             return df # Éxito, retorna el DataFrame y sale del bucle
+        
+        except BinanceAPIException as e:
+            # Si es un error de Binance, imprime el código de error.
+            print(f"❌ Error CRÍTICO (Binance API Code {e.code}) al obtener datos para {symbol}: {e}. Saltando el par.")
+            return None # Fallo final, devuelve None
             
         except Exception as e:
             wait_time = 2 ** attempt # Backoff exponencial (1s, 2s, 4s, 8s...)
@@ -226,7 +235,8 @@ def get_signal(df, symbol):
 def update_balances():
     """Actualiza los balances de USDT, BNB y de todos los activos vigilados."""
     try:
-        account_info = client.get_account()
+        # Se usa el cliente autenticado
+        account_info = client.get_account() 
         balances = {asset['asset']: float(asset['free']) for asset in account_info['balances']}
 
         # 1. Actualizar saldos principales
@@ -239,7 +249,8 @@ def update_balances():
             bot_state["current_state"]["asset_balances"][base_asset] = balances.get(base_asset, 0.0)
 
     except Exception as e:
-        print(f"❌ Error al actualizar balances: {e}")
+        # Si esta sección falla, CONFIRMA que la autenticación (claves) es el problema.
+        print(f"❌ Error al actualizar balances (REQUIERE AUTENTICACIÓN): {e}")
 
 def execute_order(symbol, signal, current_price):
     """Ejecuta una orden de COMPRA o VENTA si DRY_RUN es False para un símbolo específico."""
@@ -266,7 +277,8 @@ def execute_order(symbol, signal, current_price):
         quantity = usd_to_spend / current_price
         
         try:
-            info = client.get_symbol_info(symbol=symbol)
+            # Se usa el cliente autenticado
+            info = client.get_symbol_info(symbol=symbol) 
             step_size = float(info['filters'][2]['stepSize'])
             quantity = np.floor(quantity / step_size) * step_size # Redondeo de la cantidad
         except Exception as e:
@@ -280,21 +292,22 @@ def execute_order(symbol, signal, current_price):
             bot_state["current_state"]["balances"]["free_USDT"] -= usd_to_spend
             bot_state["current_state"]["asset_balances"][base_asset] = bot_state["current_state"]["asset_balances"].get(base_asset, 0.0) + quantity
         else:
-            # ORDEN REAL DE BINANCE
+            # ORDEN REAL DE BINANCE (Requiere cliente autenticado)
             try:
                 print(f"💰 {symbol} - BUY (REAL): Enviando orden de mercado para comprar {quantity:.2f} {base_asset}...")
                 order = client.create_order(symbol=symbol, side='BUY', type='MARKET', quantity=quantity)
                 print(f"✅ {symbol} - Orden de COMPRA ejecutada. Status: {order['status']}")
                 bot_state["trade_history"].append({"time": bot_state["current_state"]["last_run_utc"], "symbol": symbol, "type": "BUY", "quantity": quantity, "price": current_price, "status": order['status']})
             except Exception as e:
-                 print(f"❌ {symbol} - FALLO AL EJECUTAR ORDEN REAL DE COMPRA: {e}")
+                 print(f"❌ {symbol} - FALLO AL EJECUTAR ORDEN REAL DE COMPRA (REQUIERE AUTENTICACIÓN): {e}")
 
 
     elif signal == "SELL":
         quantity = base_free
         
         try:
-            info = client.get_symbol_info(symbol=symbol)
+            # Se usa el cliente autenticado
+            info = client.get_symbol_info(symbol=symbol) 
             step_size = float(info['filters'][2]['stepSize'])
             quantity = np.floor(quantity / step_size) * step_size
         except Exception as e:
@@ -313,14 +326,14 @@ def execute_order(symbol, signal, current_price):
             bot_state["current_state"]["balances"]["free_USDT"] += revenue
             bot_state["current_state"]["asset_balances"][base_asset] = 0.0
         else:
-            # ORDEN REAL DE BINANCE
+            # ORDEN REAL DE BINANCE (Requiere cliente autenticado)
             try:
                 print(f"💸 {symbol} - SELL (REAL): Enviando orden de mercado para vender {quantity:.2f} {base_asset}...")
                 order = client.create_order(symbol=symbol, side='SELL', type='MARKET', quantity=quantity)
                 print(f"✅ {symbol} - Orden de VENTA ejecutada. Status: {order['status']}")
                 bot_state["trade_history"].append({"time": bot_state["current_state"]["last_run_utc"], "symbol": symbol, "type": "SELL", "quantity": quantity, "price": current_price, "status": order['status']})
             except Exception as e:
-                 print(f"❌ {symbol} - FALLO AL EJECUTAR ORDEN REAL DE VENTA: {e}")
+                 print(f"❌ {symbol} - FALLO AL EJECUTAR ORDEN REAL DE VENTA (REQUIERE AUTENTICACIÓN): {e}")
 
 
 # --- 5. BUCLE PRINCIPAL DEL BOT (Thread) (MODIFICADO PARA MULTI-PAR) ---
@@ -342,20 +355,23 @@ def bot_loop():
             
             # 🚨 Bucle que procesa cada símbolo en la lista 🚨
             for symbol in SYMBOLS_LIST:
-                df = get_data(symbol)
+                # 1. Obtener datos (Usa public_client, NO requiere firma)
+                df = get_data(symbol) 
                 if df is None:
                     print(f"⚠️ {symbol}: No se obtuvieron datos, saltando análisis para este par.")
                     continue
 
+                # 2. Generar señal
                 signal, decision_score = get_signal(df, symbol)
                 current_price = df.iloc[-1]['close']
                 
                 print(f"📊 {symbol} | Señal: {signal} (Puntaje: {decision_score:.1f}) | Precio: {current_price:.4f}")
                 
+                # 3. Ejecutar orden (Usa cliente, SÍ requiere firma)
                 if signal != "HOLD":
                     execute_order(symbol, signal, current_price)
                     
-            # Actualizamos todos los balances al final del ciclo
+            # Actualizamos todos los balances al final del ciclo (Usa cliente, SÍ requiere firma)
             update_balances()
             print(f"🟢 Ciclo completado para todos los pares. Volviendo a dormir por {SLEEP_SEC} segundos.")
 
