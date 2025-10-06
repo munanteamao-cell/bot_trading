@@ -26,7 +26,7 @@ PCT_OF_BALANCE = float(os.environ.get('PCT_OF_BALANCE', 0.5))
 SLEEP_SEC = int(os.environ.get('SLEEP_SEC', 300))
 MIN_ORDER_USD = float(os.environ.get('MIN_ORDER_USD', 10.5)) 
 
-# Umbral Restaurado a 3.0
+# Umbral de decisión (mantener en 3.0 para la prueba)
 DECISION_THRESHOLD = 3.0 
 
 MAX_RETRIES = 5 
@@ -65,9 +65,9 @@ if not API_KEY or not API_SECRET:
     exit()
 
 try:
-    # CLIENTE AUTENTICADO
+    # CLIENTE AUTENTICADO (Para órdenes y balances)
     client = Client(API_KEY, API_SECRET)
-    # CLIENTE PÚBLICO
+    # CLIENTE PÚBLICO (Para datos de mercado e info de símbolos)
     public_client = Client("", "") 
     
     # Determinar el entorno de conexión
@@ -92,7 +92,33 @@ except Exception as e:
     print(f"❌ Error al conectar con Binance. Revise credenciales, entorno (real/testnet) y restricciones geográficas. {e}")
     exit()
 
-# --- 3. FUNCIONES DE ESTRATEGIA (MODIFICADA PARA FORZAR COMPRA) ---
+# --- 3. FUNCIONES DE ESTRATEGIA Y UTILIDAD ---
+
+def get_symbol_step_size(symbol):
+    """
+    Obtiene el 'stepSize' para un símbolo usando el cliente público.
+    Esto evita fallos de autenticación en DRY_RUN.
+    """
+    # 8 decimales es un valor seguro por defecto
+    default_step_size = 0.00000001
+    
+    try:
+        # Usamos el cliente PÚBLICO
+        info = public_client.get_symbol_info(symbol=symbol)
+        
+        # Buscamos el filtro LOT_SIZE
+        for f in info['filters']:
+            if f['filterType'] == 'LOT_SIZE':
+                return float(f['stepSize'])
+        
+        # Si no encontramos LOT_SIZE, usamos el valor por defecto y advertimos
+        print(f"⚠️ {symbol} - ADVERTENCIA: No se encontró el filtro 'LOT_SIZE'. Usando {default_step_size} por defecto.")
+        return default_step_size
+        
+    except Exception as e:
+        # Si falla completamente (ej. conexión), usamos el valor por defecto
+        print(f"❌ {symbol} - FALLO AL OBTENER 'stepSize' (API ERROR): {e}. Usando {default_step_size} por defecto.")
+        return default_step_size
 
 def get_data(symbol):
     """Obtiene datos de velas y calcula indicadores para un símbolo específico, con reintentos."""
@@ -188,8 +214,9 @@ def get_signal(df, symbol):
     
     # 3. Criterio de MACD (Momento)
     # 🚨 PRUEBA DE COMPRA SIMULADA: Se aumenta el puntaje para asegurar la señal BUY para TRXUSDT
+    # Se añade un +3.5 temporal para forzar la compra simulada
     if symbol == "TRXUSDT" and macd_line > macd_signal and prev_row['macd_line'] <= prev_row['macd_signal']:
-        buy_score += 3.5 # Esto fuerza el puntaje a ser > 3.0
+        buy_score += 3.5 
     elif macd_line > macd_signal and prev_row['macd_line'] <= prev_row['macd_signal']:
         buy_score += 1.5
     elif macd_line < macd_signal and prev_row['macd_line'] >= prev_row['macd_signal']:
@@ -216,21 +243,23 @@ def get_signal(df, symbol):
 
     return signal, decision_score
 
-# --- 4. FUNCIONES DE EJECUCIÓN (MODIFICADA PARA FORZAR SALDO EN DRY_RUN) ---
+# --- 4. FUNCIONES DE EJECUCIÓN ---
 
 def update_balances():
     """Actualiza los balances de USDT, BNB y de todos los activos vigilados."""
     
     if DRY_RUN:
         # 🚨 FORZADO DE SALDO: Forzamos un saldo alto para la simulación de compra
-        FORCED_USDT_BALANCE = 1000.0 
+        # Mantiene el saldo si ya se ha realizado una simulación (ej. 1000 -> 500)
+        FORCED_USDT_BALANCE = 1000.0 if not bot_state["trade_history"] else bot_state["current_state"]["balances"]["free_USDT"]
+        
         bot_state["current_state"]["balances"]["free_USDT"] = FORCED_USDT_BALANCE 
         
-        # Asumimos que no hay ninguna moneda base comprada para la primera compra.
+        # Mantenemos los saldos de las monedas base intactos si ya se compró
         for symbol in SYMBOLS_LIST:
             base_asset = symbol.replace("USDT", "")
-            # Mantenemos el saldo de las monedas base a 0 para poder comprar
-            bot_state["current_state"]["asset_balances"][base_asset] = 0.0 
+            if base_asset not in bot_state["current_state"]["asset_balances"]:
+                bot_state["current_state"]["asset_balances"][base_asset] = 0.0
         
         print(f"✅ Balances de la cuenta actualizados (SIMULACIÓN). USDT disponible: {bot_state['current_state']['balances']['free_USDT']:.2f}")
         return
@@ -261,17 +290,8 @@ def execute_order(symbol, signal, current_price):
     usdt_free_total = bot_state["current_state"]["balances"]["free_USDT"]
     base_free = bot_state["current_state"]["asset_balances"].get(base_asset, 0.0)
     
-    # 🚨 FIX CRÍTICO: Intentar obtener el stepSize, si falla, usar un valor seguro
-    try:
-        # Intentamos obtener la información real del símbolo (esto requiere el cliente autenticado)
-        info = client.get_symbol_info(symbol=symbol) 
-        step_size = float(info['filters'][2]['stepSize'])
-    except Exception as e:
-        # Si falla (como en DRY_RUN sin permisos de trading), registramos el error y usamos un valor seguro.
-        print(f"⚠️ {symbol} - ADVERTENCIA: No se pudo obtener 'stepSize' para redondeo: {e}. Usando 8 decimales por defecto (0.00000001).")
-        # 8 decimales es un valor seguro para la mayoría de las criptomonedas.
-        step_size = 0.00000001
-
+    # Obtener el tamaño de paso (stepSize) usando la nueva función PÚBLICA
+    step_size = get_symbol_step_size(symbol)
 
     if signal == "BUY":
         # Calcula el capital a gastar usando el porcentaje del saldo total de USDT
@@ -287,7 +307,7 @@ def execute_order(symbol, signal, current_price):
 
         quantity = usd_to_spend / current_price
         
-        # Redondeo de la cantidad usando el step_size obtenido o por defecto
+        # Redondeo de la cantidad usando el step_size obtenido
         quantity = np.floor(quantity / step_size) * step_size 
 
         if DRY_RUN:
@@ -312,7 +332,7 @@ def execute_order(symbol, signal, current_price):
     elif signal == "SELL":
         quantity = base_free
         
-        # Redondeo de la cantidad usando el step_size obtenido o por defecto
+        # Redondeo de la cantidad usando el step_size obtenido
         quantity = np.floor(quantity / step_size) * step_size 
         
         # Asegura que la cantidad a vender sea suficiente
@@ -357,7 +377,7 @@ def bot_loop():
             
             # Bucle que procesa cada símbolo en la lista
             for symbol in SYMBOLS_LIST:
-                # 1. Obtener datos (Usa public_client, NO requiere firma)
+                # 1. Obtener datos (Usa public_client)
                 df = get_data(symbol) 
                 if df is None:
                     print(f"⚠️ {symbol}: No se obtuvieron datos, saltando análisis para este par.")
@@ -369,11 +389,11 @@ def bot_loop():
                 
                 print(f"📊 {symbol} | Señal: {signal} (Puntaje: {decision_score:.1f}) | Precio: {current_price:.4f}")
                 
-                # 3. Ejecutar orden (Usa cliente, SÍ requiere firma)
+                # 3. Ejecutar orden
                 if signal != "HOLD":
                     execute_order(symbol, signal, current_price)
                     
-            # Actualizamos todos los balances al final del ciclo (Usa cliente, SÍ requiere firma)
+            # Actualizamos todos los balances al final del ciclo
             update_balances()
             print(f"🟢 Ciclo completado para todos los pares. Volviendo a dormir por {SLEEP_SEC} segundos.")
 
