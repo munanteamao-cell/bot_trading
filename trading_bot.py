@@ -32,7 +32,8 @@ PCT_OF_BALANCE = float(os.environ.get('PCT_OF_BALANCE', 0.5))
 SLEEP_SEC = int(os.environ.get('SLEEP_SEC', 300))
 MIN_ORDER_USD = float(os.environ.get('MIN_ORDER_USD', 10.5)) # Subido a 10.5 por seguridad
 # Nuevo Umbral de Decisión: La señal debe tener al menos este puntaje para ejecutarse.
-DECISION_THRESHOLD = 3 # Puntos de decisión requeridos para una señal
+# 🚨 PRUEBA DE COMPRA SIMULADA: Se reduce a 0.5 para forzar una señal de compra (ya que el puntaje es 1.5)
+DECISION_THRESHOLD = 0.5 # Puntos de decisión requeridos para una señal (Originalmente 3)
 
 # NUEVA CONSTANTE: Máximo de reintentos para las llamadas al API de datos
 MAX_RETRIES = 5 
@@ -237,6 +238,20 @@ def get_signal(df, symbol):
 
 def update_balances():
     """Actualiza los balances de USDT, BNB y de todos los activos vigilados."""
+    # 🚨 NOTA: Para esta prueba, si DRY_RUN es True, forzamos un saldo de USDT para simular una compra.
+    # En modo REAL, esta sección siempre trae el saldo real de Binance.
+    if DRY_RUN:
+        # Se asume un saldo para la simulación, ya que get_account() puede fallar si las claves no tienen el permiso correcto
+        # o si la cuenta está completamente vacía y la API no devuelve la info de balance.
+        bot_state["current_state"]["balances"]["free_USDT"] = 100.0 # 100 USDT de saldo simulado
+        # Se asume que no hay ninguna moneda base comprada (como TRX, XRP, BTC) para la primera compra.
+        for symbol in SYMBOLS_LIST:
+            base_asset = symbol.replace("USDT", "")
+            bot_state["current_state"]["asset_balances"][base_asset] = 0.0
+        
+        print(f"✅ Balances de la cuenta actualizados (SIMULACIÓN). USDT disponible: {bot_state['current_state']['balances']['free_USDT']:.2f}")
+        return # Salimos de la función si estamos en DRY_RUN
+        
     try:
         # Se usa el cliente autenticado
         account_info = client.get_account() 
@@ -252,7 +267,7 @@ def update_balances():
             bot_state["current_state"]["asset_balances"][base_asset] = balances.get(base_asset, 0.0)
         
         # MENSAJE DE ÉXITO AL CARGAR BALANCES (Añadido para mejor tracking)
-        print(f"✅ Balances de la cuenta actualizados. USDT disponible: {bot_state['current_state']['balances']['free_USDT']:.2f}")
+        print(f"✅ Balances de la cuenta actualizados (REAL). USDT disponible: {bot_state['current_state']['balances']['free_USDT']:.2f}")
 
 
     except Exception as e:
@@ -296,6 +311,7 @@ def execute_order(symbol, signal, current_price):
         if DRY_RUN:
             # SIMULACIÓN DE ORDEN (Ajusta los balances en el estado local)
             print(f"💰 {symbol} - BUY (Simulado): Compraría {quantity:.2f} {base_asset} a {current_price:.4f} USD. (Costo: {usd_to_spend:.2f})")
+            # 🚨 ACTUALIZACIÓN DE SALDO SIMULADA: Simulamos la compra restando USDT y sumando el activo base
             bot_state["current_state"]["balances"]["free_USDT"] -= usd_to_spend
             bot_state["current_state"]["asset_balances"][base_asset] = bot_state["current_state"]["asset_balances"].get(base_asset, 0.0) + quantity
         else:
