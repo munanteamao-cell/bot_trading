@@ -213,11 +213,7 @@ def get_signal(df, symbol):
         sell_score += 2
     
     # 3. Criterio de MACD (Momento)
-    # 🚨 PRUEBA DE COMPRA SIMULADA: Se aumenta el puntaje para asegurar la señal BUY para TRXUSDT
-    # Se añade un +3.5 temporal para forzar la compra simulada
-    if symbol == "TRXUSDT" and macd_line > macd_signal and prev_row['macd_line'] <= prev_row['macd_signal']:
-        buy_score += 3.5 
-    elif macd_line > macd_signal and prev_row['macd_line'] <= prev_row['macd_signal']:
+    if macd_line > macd_signal and prev_row['macd_line'] <= prev_row['macd_signal']:
         buy_score += 1.5
     elif macd_line < macd_signal and prev_row['macd_line'] >= prev_row['macd_signal']:
         sell_score += 1.5
@@ -227,6 +223,12 @@ def get_signal(df, symbol):
         buy_score += 1
     elif current_price > bollinger_upper:
         sell_score += 1
+
+    # 🚨 FIX CRÍTICO para asegurar la primera compra simulada
+    # Solo aplicamos el puntaje extra si el historial de trades está vacío (primera ejecución)
+    if symbol == "TRXUSDT" and not bot_state["trade_history"]:
+        buy_score += 3.5 
+        print("🚨 Forzando la señal de COMPRA para TRXUSDT en el primer ciclo de simulación.")
 
     # --- EVALUACIÓN DE LA DECISIÓN ---
     
@@ -249,11 +251,11 @@ def update_balances():
     """Actualiza los balances de USDT, BNB y de todos los activos vigilados."""
     
     if DRY_RUN:
-        # 🚨 FORZADO DE SALDO: Forzamos un saldo alto para la simulación de compra
-        # Mantiene el saldo si ya se ha realizado una simulación (ej. 1000 -> 500)
-        FORCED_USDT_BALANCE = 1000.0 if not bot_state["trade_history"] else bot_state["current_state"]["balances"]["free_USDT"]
-        
-        bot_state["current_state"]["balances"]["free_USDT"] = FORCED_USDT_BALANCE 
+        # Lógica de saldo simulado
+        # Si no hay historial de trades, inicializamos a 1000 USDT. Si ya hay trades, mantenemos el saldo simulado.
+        initial_usdt = 1000.0
+        if not bot_state["trade_history"]:
+            bot_state["current_state"]["balances"]["free_USDT"] = initial_usdt
         
         # Mantenemos los saldos de las monedas base intactos si ya se compró
         for symbol in SYMBOLS_LIST:
@@ -297,6 +299,7 @@ def execute_order(symbol, signal, current_price):
         # Calcula el capital a gastar usando el porcentaje del saldo total de USDT
         usd_to_spend = usdt_free_total * PCT_OF_BALANCE
         
+        # Límite de gasto
         if usd_to_spend > usdt_free_total:
              usd_to_spend = usdt_free_total
         
