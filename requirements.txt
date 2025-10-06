@@ -4,4 +4,6 @@ python-binance
 gunicorn
 backtrader
 numpy
+scikit-learn
+joblib
 
