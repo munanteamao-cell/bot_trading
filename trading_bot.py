@@ -1,388 +1,501 @@
+# ----------------------------------------------------------------------------------
+# CONFIGURACION E IMPORTACIONES
+# ----------------------------------------------------------------------------------
 import os
 import time
+import json
 import logging
-import threading
-from datetime import datetime
+from datetime import datetime, timedelta
+
+# Librerías de Trading
 from binance.client import Client
 from binance.exceptions import BinanceAPIException
+from binance.enums import *
 
-# Librerías para Machine Learning
-import pandas as pd
+# Librerías de Análisis y Machine Learning
 import numpy as np
-from sklearn.model_selection import train_test_split
-from sklearn.linear_model import LogisticRegression
+import pandas as pd
 from sklearn.preprocessing import StandardScaler
-from joblib import dump, load
-from concurrent.futures import ThreadPoolExecutor
+from sklearn.linear_model import LogisticRegression
 
-# Flask para el servicio web
-from flask import Flask, jsonify, request
-from threading import Thread
+# ----------------------------------------------------------------------------------
+# CONFIGURACION GLOBAL
+# ----------------------------------------------------------------------------------
 
-# --- Configuración Inicial ---
+# Claves de la API (Usará las variables de entorno de Render)
+API_KEY = os.environ.get('BINANCE_API_KEY')
+API_SECRET = os.environ.get('BINANCE_API_SECRET')
+FUTURES_TESTNET_URL = os.environ.get('FUTURES_TESTNET_URL', 'https://testnet.binancefuture.com')
+
+# Configuración del Bot
+SYMBOL_PAIRS = ['TRXUSDT', 'XRPUSDT', 'BTCUSDT']  # Pares a vigilar
+INTERVAL = Client.KLINE_INTERVAL_15MINUTE
+LOOKBACK_PERIOD = "100 days ago UTC" # Periodo para la data histórica de entrenamiento
+CYCLE_DELAY_SECONDS = 300 # 5 minutos
+MODEL_TARGET_CANDLES = 4 # Cuántas velas al futuro intentamos predecir (1 hora)
+MODEL_CONFIDENCE_THRESHOLD = 0.55 # Probabilidad mínima para abrir una posición
+
+# Estado global del bot y del modelo
+APP_STATE = {
+    'dry_run': True, # Modo de simulacion por defecto
+    'balances': {'free_USDT': 1000.00, 'in_position_USDT': 0.0},
+    'open_positions': {},
+    'model_ready': False,
+    'last_run_utc': None,
+    'symbol_data': {}
+}
+
+# Variable para el modelo ML y el escalador, se cargan al inicio
+ML_MODEL = None
+SCALER = None
 
 # Configuración de Logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)s | %(message)s')
+logger = logging.getLogger(__name__)
 
-# Claves de la API (obtenidas de variables de entorno)
-# NOTA: Para entrenar el modelo (initialize_ml_model), se requiere la API de PRODUCCIÓN para datos históricos.
-API_KEY = os.environ.get('BINANCE_API_KEY')
-API_SECRET = os.environ.get('BINANCE_API_SECRET')
+# ----------------------------------------------------------------------------------
+# UTILIDADES Y CONEXIÓN
+# ----------------------------------------------------------------------------------
 
-# URL de la API de Testnet (para operar de forma segura)
-FUTURES_TESTNET_URL = os.environ.get('FUTURES_TESTNET_URL', 'https://testnet.binancefuture.com')
-
-# --- Estado Global del Bot ---
-
-app = Flask(__name__)
-
-# Estado compartido para el ciclo de trading
-state = {
-    'is_running': False,
-    'current_mode': 'DRY_RUN',
-    'last_run_utc': None,
-    'symbol_data': {}, # Datos técnicos y señales por par
-    'balances': {'free_USDT': 0.0, 'total_USDT': 0.0},
-    'ml_model': None, # El modelo de ML cargado en memoria
-    'ml_scaler': None, # El scaler para normalizar datos
-    'is_ml_ready': False,
-    'monitored_symbols': ['TRXUSDT', 'XRPUSDT', 'BTCUSDT'],
-    'interval': '5m',
-    'limit_percent': 0.005, # % de margen por operación (0.5%)
-    'initial_capital': 1000.00
-}
-
-# Parámetros de Trading
-TRADE_INTERVAL_SECONDS = 300 # 5 minutos
-MODEL_CONFIDENCE_THRESHOLD = 0.70 # Probabilidad mínima del modelo para BUY/SELL
-
-# Inicialización del Cliente de Binance
-try:
-    # Usamos la URL de Testnet para el trading por seguridad (DRY_RUN)
-    client = Client(API_KEY, API_SECRET, base_url=FUTURES_TESTNET_URL)
-    state['is_running'] = True
-    logging.info("🟢 Conectado a Binance PRODUCCIÓN (SIMULACIÓN). Estado de la cuenta: True")
-    state['current_mode'] = 'DRY_RUN' 
-except Exception as e:
-    logging.error(f"🔴 Error al conectar con Binance: {e}")
-    state['is_running'] = False
-
-
-# --- Funciones de Utilidad de ML (Auto-Entrenamiento) ---
-
-def calculate_ml_features(df):
-    """Calcula indicadores técnicos y Funding Rate para usar como features de ML."""
-    # 1. Indicadores Comunes
-    df['RSI'] = compute_rsi(df['Close'], window=14)
-    df['EMA20'] = df['Close'].ewm(span=20, adjust=False).mean()
-    df['EMA50'] = df['Close'].ewm(span=50, adjust=False).mean()
-    df['EMA100'] = df['Close'].ewm(span=100, adjust=False).mean()
-
-    # 2. MACD
-    exp12 = df['Close'].ewm(span=12, adjust=False).mean()
-    exp26 = df['Close'].ewm(span=26, adjust=False).mean()
-    df['MACD'] = exp12 - exp26
-    df['Signal_Line'] = df['MACD'].ewm(span=9, adjust=False).mean()
-
-    # 3. Volatilidad (ATR Simple: Rango Alto - Bajo)
-    df['Volatilidad'] = df['High'] - df['Low']
-
-    # 4. Target (Variable Objetivo): Sube/Baja en la siguiente vela
-    # 1 si el precio sube en la siguiente vela, 0 si baja/se mantiene
-    # Se usa shift(-1) para que la fila N tenga el resultado de la vela N+1
-    df['Target'] = (df['Close'].shift(-1) > df['Close']).astype(int)
-
-    # 5. Features Finales (seleccionadas para el modelo)
-    features = df[['RSI', 'EMA20', 'EMA50', 'EMA100', 'MACD', 'Signal_Line', 'Volatilidad']].iloc[:-1] # Excluimos la última fila sin Target
-    target = df['Target'].iloc[:-1]
+def initialize_client():
+    """Inicializa el cliente de Binance para Testnet o Producción."""
+    global APP_STATE
     
-    # Manejo de NaNs (rellenar con 0 o la media)
-    features = features.fillna(features.mean())
+    # 1. Determinar el modo de ejecución
+    # Si la clave 'DRY_RUN' está presente en el entorno y es 'false' (o no está), asumimos REAL
+    dry_run_env = os.environ.get('DRY_RUN', 'true').lower()
+    APP_STATE['dry_run'] = (dry_run_env != 'false')
     
-    return features, target
-
-def compute_rsi(data, window):
-    """Función para calcular el RSI."""
-    diff = data.diff(1)
-    gain = diff.where(diff > 0, 0)
-    loss = -diff.where(diff < 0, 0)
-    avg_gain = gain.ewm(com=window - 1, min_periods=window).mean()
-    avg_loss = loss.ewm(com=window - 1, min_periods=window).mean()
-    rs = avg_gain / avg_loss
-    return 100 - (100 / (1 + rs))
-
-def get_funding_rate(symbol):
-    """Obtiene la Funding Rate actual de Binance (usando la API de producción)."""
+    # Si no hay claves, forzamos DRY_RUN para evitar errores
+    if not API_KEY or not API_SECRET:
+        APP_STATE['dry_run'] = True
+        logger.warning("Claves API no encontradas. Bot iniciado en modo DRY_RUN forzado (Simulación).")
+        
     try:
-        # **ATENCIÓN:** Usamos la API de PRODUCCIÓN para obtener la Funding Rate en vivo
-        # Es por diseño para tener datos reales, aunque operemos en Testnet/DRY_RUN
-        prod_client = Client(API_KEY, API_SECRET)
-        rate_info = prod_client.futures_funding_rate(symbol=symbol)
-        if rate_info:
-            return float(rate_info[0]['fundingRate'])
-        return 0.0
+        # Inicializa el cliente principal con las claves de Producción (necesario para data histórica)
+        client = Client(API_KEY, API_SECRET)
+        
+        if APP_STATE['dry_run']:
+            # Para Testnet (simulación de órdenes de trading)
+            client.futures_base_url = FUTURES_TESTNET_URL
+            logger.info(f"✅ Conectado a Binance TESTNET (SIMULACIÓN). Estado de la cuenta: {client.get_account_status().get('data', {}).get('state')}")
+        else:
+            # Para Producción (órdenes de trading reales)
+            logger.info("✅ Conectado a Binance PRODUCCIÓN (DINERO REAL). Estado de la cuenta: True")
+        
+        logger.info(f"Bot iniciado en modo: {'DRY_RUN' if APP_STATE['dry_run'] else 'REAL'}.")
+        logger.info(f"Vigilando: {', '.join(SYMBOL_PAIRS)}")
+        return client
+    
     except Exception as e:
-        logging.error(f"🔴 Error al obtener Funding Rate para {symbol}: {e}")
+        logger.critical(f"❌ Error al inicializar el cliente de Binance: {e}")
+        logger.warning("Forzando modo DRY_RUN debido a error de conexión o credenciales.")
+        APP_STATE['dry_run'] = True
+        return Client(API_KEY, API_SECRET) # Intenta inicializar de nuevo sin Testnet URL
+
+# ----------------------------------------------------------------------------------
+# FUNCIONES DE DATOS Y INDICADORES
+# ----------------------------------------------------------------------------------
+
+def get_funding_rate(client, symbol):
+    """Obtiene la última tasa de funding rate para un símbolo."""
+    try:
+        # Se requiere la API de Producción para este endpoint, Testnet no lo tiene.
+        rate_info = client.futures_funding_rate(symbol=symbol)
+        return float(rate_info[0]['fundingRate']) if rate_info else 0.0
+    except Exception as e:
+        # Esto sucede en Testnet o si la clave de Prod es inválida. Asumimos 0.
+        logger.warning(f"Error al obtener Funding Rate para {symbol}: {e}. Asumiendo 0.0")
         return 0.0
 
-
-def initialize_ml_model(symbol):
-    """
-    Entrena un modelo de Regresión Logística y lo almacena en memoria.
-    Esto se ejecuta solo una vez al inicio del bot.
-    """
-    global client
-    logging.warning("Modelo ML no encontrado en memoria. INICIANDO ENTRENAMIENTO...")
-
+def get_binance_data(client, symbol, interval, lookback):
+    """Descarga velas históricas y las formatea como DataFrame."""
     try:
-        # Temporalmente, cambiamos el cliente a la URL de PRODUCCIÓN para la descarga de datos
-        # Esto requiere las claves de PRODUCCIÓN en el entorno de Render
-        training_client = Client(API_KEY, API_SECRET)
+        # Descarga la data histórica
+        klines = client.futures_historical_klines(symbol, interval, lookback)
         
-        logging.info(f"Buscando datos históricos de {symbol} por 100 days ago UTC...")
+        # Formatea a DataFrame
+        data = pd.DataFrame(klines, columns=[
+            'open_time', 'Open', 'High', 'Low', 'Close', 'Volume', 
+            'close_time', 'quote_asset_volume', 'number_of_trades', 
+            'taker_buy_base_asset_volume', 'taker_buy_quote_asset_volume', 'ignore'
+        ])
         
-        # Descarga de datos
-        klines = training_client.get_historical_klines(
-            symbol,
-            state['interval'],
-            "100 days ago UTC"
-        )
-        
-        # Convertir a DataFrame
-        data = pd.DataFrame(klines, columns=['Open time', 'Open', 'High', 'Low', 'Close', 'Volume', 'Close time', 'Quote asset volume', 'Number of trades', 'Taker buy base asset volume', 'Taker buy quote asset volume', 'Ignore'])
+        # Limpieza y preparación de columnas
         data['Close'] = pd.to_numeric(data['Close'])
+        data['Open'] = pd.to_numeric(data['Open'])
         data['High'] = pd.to_numeric(data['High'])
         data['Low'] = pd.to_numeric(data['Low'])
-
-        # Calcular Features y Target
-        features, target = calculate_ml_features(data)
-
-        # Dividir datos
-        X_train, X_test, y_train, y_test = train_test_split(features, target, test_size=0.2, random_state=42, shuffle=False)
-
-        # Escalar/Normalizar Features
-        scaler = StandardScaler()
-        X_train_scaled = scaler.fit_transform(X_train)
-        X_test_scaled = scaler.transform(X_test)
-
-        # Entrenar el Modelo (Regresión Logística)
-        model = LogisticRegression(solver='liblinear', random_state=42)
-        model.fit(X_train_scaled, y_train)
-
-        # Evaluar el modelo (opcional)
-        accuracy = model.score(X_test_scaled, y_test)
-        logging.info(f"🤖 Precisión del modelo de Regresión Logística para {symbol}: {accuracy:.4f}")
-
-        # Guardar en el estado (memoria)
-        state['ml_model'] = model
-        state['ml_scaler'] = scaler
-        state['is_ml_ready'] = True
+        data['open_time'] = pd.to_datetime(data['open_time'], unit='ms')
+        data.set_index('open_time', inplace=True)
         
-        logging.info("✅ Modelo ML cargado en memoria exitosamente.")
-
+        return data[['Open', 'High', 'Low', 'Close']].iloc[:-1] # Excluye la vela actual incompleta
     except BinanceAPIException as e:
-        # Si las claves de Prod no funcionan para descargar (ej: error -1000), el bot no puede entrenar
-        logging.critical(f"🔴 CRÍTICO: Error de API de Binance al intentar descargar data para ML. Verifica tus claves de PRODUCCIÓN. {e}")
+        logger.error(f"Error de API al obtener datos para {symbol}: {e}")
+        return pd.DataFrame()
     except Exception as e:
-        logging.critical(f"🔴 CRÍTICO: Error inesperado durante el entrenamiento de ML: {e}")
+        logger.error(f"Error inesperado al obtener datos para {symbol}: {e}")
+        return pd.DataFrame()
 
-
-# --- Funciones de Trading Principal ---
-
-def get_binance_data(symbol, interval='5m', limit=500):
-    """Obtiene datos de velas de Binance y calcula indicadores."""
+def calculate_indicators(data, funding_rate):
+    """Calcula indicadores técnicos (RSI, EMA, MACD, etc.)."""
     
-    # 1. Obtener Klines
-    try:
-        # Obtener datos de velas (Close time, Open, High, Low, Close)
-        klines = client.get_historical_klines(symbol, interval, limit=limit)
-        
-        # Convertir a DataFrame
-        df = pd.DataFrame(klines, columns=['Open time', 'Open', 'High', 'Low', 'Close', 'Volume', 'Close time', 'Quote asset volume', 'Number of trades', 'Taker buy base asset volume', 'Taker buy quote asset volume', 'Ignore'])
-        df['Close'] = pd.to_numeric(df['Close'])
-        df['Open'] = pd.to_numeric(df['Open'])
-        df['High'] = pd.to_numeric(df['High'])
-        df['Low'] = pd.to_numeric(df['Low'])
-        
-        # 2. Obtener Funding Rate
-        funding_rate = get_funding_rate(symbol)
-        df['FundingRate'] = funding_rate
-        
-        return df
-    except Exception as e:
-        logging.error(f"🔴 Error al obtener datos de velas para {symbol}: {e}")
+    # Asegurar que el DataFrame no esté vacío
+    if data.empty:
         return None
 
-def calculate_ml_decision(df):
-    """Usa el modelo de Regresión Logística para predecir la probabilidad de BUY/SELL."""
+    # RSI (Relative Strength Index) - Periodo 14
+    delta = data['Close'].diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+    RS = gain / loss
+    data['RSI'] = 100 - (100 / (1 + RS))
     
-    if not state['is_ml_ready']:
-        return "HOLD", 0.5 # Default si el modelo no está cargado
+    # EMA (Exponential Moving Average) - Periodo 50
+    data['EMA50'] = data['Close'].ewm(span=50, adjust=False).mean()
     
-    # 1. Preparar el DataFrame para la predicción
-    # Usamos la misma función de features, pero solo la última fila completa
-    features, _ = calculate_ml_features(df)
-    
-    # Seleccionamos el último conjunto de features para predecir
-    latest_features = features.iloc[[-1]]
-    
-    # 2. Normalizar las features (CRÍTICO: usar el mismo scaler del entrenamiento)
-    latest_features_scaled = state['ml_scaler'].transform(latest_features)
-    
-    # 3. Predicción de Probabilidad
-    # predict_proba retorna [[Prob_Clase_0 (SELL/HOLD), Prob_Clase_1 (BUY)]]
-    probabilities = state['ml_model'].predict_proba(latest_features_scaled)[0]
-    prob_buy = probabilities[1]
-    
-    # 4. Decisión Final basada en el umbral de confianza
-    if prob_buy >= MODEL_CONFIDENCE_THRESHOLD:
-        signal = "BUY"
-    elif prob_buy <= (1 - MODEL_CONFIDENCE_THRESHOLD): # Umbral opuesto para SELL
-        signal = "SELL"
-    else:
-        signal = "HOLD"
+    # MACD (Moving Average Convergence Divergence)
+    data['EMA12'] = data['Close'].ewm(span=12, adjust=False).mean()
+    data['EMA26'] = data['Close'].ewm(span=26, adjust=False).mean()
+    data['MACD'] = data['EMA12'] - data['EMA26']
+    data['Signal'] = data['MACD'].ewm(span=9, adjust=False).mean()
+    data['Hist'] = data['MACD'] - data['Signal']
 
-    return signal, prob_buy
-
-def update_symbol_state(symbol, data):
-    """Actualiza los datos técnicos, la señal y el precio actual."""
+    # Funding Rate (Se añade como una columna constante, ya que solo tenemos el valor actual)
+    data['FundingRate'] = funding_rate
     
-    if data is None or data.empty:
-        logging.warning(f"⚠️ {symbol} | No se obtuvieron datos o el DF está vacío. Saltando análisis para este par.")
+    # Limpiar NaN resultantes del cálculo de indicadores
+    data.dropna(inplace=True)
+    
+    if data.empty:
+        logger.warning("DataFrame vacío después de calcular indicadores y limpiar NaN.")
+        return None
+        
+    return data
+
+# ----------------------------------------------------------------------------------
+# FUNCIONES DE MACHINE LEARNING (Fase 2)
+# ----------------------------------------------------------------------------------
+
+def create_target_variable(df):
+    """Crea la variable objetivo 'Target': 1 si el precio sube en las próximas N velas, 0 si baja/se mantiene."""
+    
+    # Calcula el precio futuro N velas adelante
+    df['FutureClose'] = df['Close'].shift(-MODEL_TARGET_CANDLES)
+    
+    # Target: 1 si el FutureClose es mayor que el Close actual, 0 en caso contrario.
+    # Usaremos una pequeña tolerancia (0.001% de movimiento) para evitar ruido.
+    df['Target'] = np.where(df['FutureClose'] > (df['Close'] * 1.00001), 1, 0)
+    
+    # Eliminar filas con NaN (las últimas N filas no tienen FutureClose)
+    return df.dropna().drop(columns=['FutureClose'])
+
+def calculate_ml_features(df):
+    """Prepara las features X para el modelo ML."""
+    
+    # Si el DF está vacío o no tiene la longitud suficiente
+    if df is None or len(df) < 1:
+        return None
+        
+    # Última fila del DataFrame (datos de la vela actual)
+    features_row = df.iloc[-1].copy()
+    
+    # 1. RSI (último valor)
+    rsi_val = features_row['RSI']
+    
+    # 2. Distancia a EMA50 (Normalizada por el precio actual)
+    # Valor positivo = precio por encima de la EMA
+    distance_to_ema = (features_row['Close'] - features_row['EMA50']) / features_row['Close']
+    
+    # 3. MACD Histograma (último valor)
+    hist_val = features_row['Hist']
+    
+    # 4. Tasa de Funding Rate (último valor)
+    funding_rate_val = features_row['FundingRate']
+
+    # 5. Volatilidad (Rango ATR simple normalizado)
+    # Se utiliza el rango de la vela actual normalizado por el Close
+    volatility = (features_row['High'] - features_row['Low']) / features_row['Close']
+    
+    # Crear el vector de features
+    X = np.array([[rsi_val, distance_to_ema, hist_val, funding_rate_val, volatility]])
+    
+    return X
+    # Continua del Bloque 1
+# ----------------------------------------------------------------------------------
+# FUNCIONES DE MACHINE LEARNING (Fase 2 - Continuación)
+# ----------------------------------------------------------------------------------
+
+def initialize_ml_model(client):
+    """Entrena y carga el modelo de Regresión Logística en memoria."""
+    global ML_MODEL, SCALER, APP_STATE
+
+    APP_STATE['model_ready'] = False
+    logger.warning("Modelo ML no encontrado en memoria. INICIANDO ENTRENAMIENTO...")
+    
+    # Usaremos BTCUSDT para un entrenamiento general más estable
+    symbol = 'BTCUSDT'
+    logger.info(f"Buscando datos históricos de {symbol} por {LOOKBACK_PERIOD}...")
+    
+    # 1. Obtener Data Histórica (Requiere claves de producción)
+    # Usamos un periodo más largo para el entrenamiento
+    data = get_binance_data(client, symbol, INTERVAL, LOOKBACK_PERIOD)
+    
+    if data.empty:
+        logger.critical("❌ NO SE PUDO DESCARGAR DATA HISTÓRICA para entrenamiento. El bot usará el modo DRY_RUN con Lógica Manual.")
+        return # Fallback a modo de predicción manual (Puntaje)
+
+    # 2. Calcular Indicadores (Features de ML)
+    # Nota: Aquí no podemos obtener el funding rate histórico fácilmente, así que usamos 0 para el training.
+    # En el make_decision, usaremos el valor actual real.
+    df = calculate_indicators(data, funding_rate=0.0)
+    
+    if df is None or df.empty:
+        logger.critical("❌ Data insuficiente para entrenamiento después de calcular indicadores.")
         return
 
-    try:
-        # Obtener señal de ML
-        signal, prob_buy = calculate_ml_decision(data)
+    # 3. Crear Target y Preparar Data
+    df_train = create_target_variable(df)
+    
+    # Columnas que serán nuestras features X
+    feature_cols = ['RSI', 'Distancia_EMA50', 'Hist', 'FundingRate', 'Volatilidad']
+    
+    # Recalcular las features X para todo el dataframe (no solo la última fila)
+    # Re-calculamos Distancia_EMA50 y Volatilidad para el training set
+    df_train['Distancia_EMA50'] = (df_train['Close'] - df_train['EMA50']) / df_train['Close']
+    df_train['Volatilidad'] = (df_train['High'] - df_train['Low']) / df_train['Close']
+    
+    X = df_train[feature_cols].values
+    y = df_train['Target'].values
+
+    if len(X) == 0:
+        logger.critical("❌ No hay suficientes muestras de datos (X) para el entrenamiento.")
+        return
+    
+    # 4. Escalar y Entrenar
+    SCALER = StandardScaler()
+    X_scaled = SCALER.fit_transform(X)
+    
+    ML_MODEL = LogisticRegression(solver='liblinear', random_state=42)
+    ML_MODEL.fit(X_scaled, y)
+    
+    # 5. Evaluación simple
+    accuracy = ML_MODEL.score(X_scaled, y)
+    
+    APP_STATE['model_ready'] = True
+    logger.info(f"✅ Modelo ML cargado en memoria exitosamente. Precisión (entrenamiento): {accuracy:.4f}")
+
+# ----------------------------------------------------------------------------------
+# LOGICA DE TRADING
+# ----------------------------------------------------------------------------------
+
+def make_decision(data, symbol, funding_rate):
+    """Toma la decisión de trading usando el modelo ML o la lógica manual."""
+    global APP_STATE
+    
+    # 1. LOGICA ML (Si está listo)
+    if APP_STATE['model_ready']:
+        try:
+            # Re-calculamos las features X con la data real de la última vela
+            df_with_indicators = calculate_indicators(data, funding_rate)
+            
+            # 1. Calcular las features para la predicción
+            X_live = calculate_ml_features(df_with_indicators)
+            
+            if X_live is None or SCALER is None:
+                raise ValueError("No se pudieron calcular las features o el escalador no está listo.")
+
+            # 2. Escalar los datos EN VIVO
+            X_live_scaled = SCALER.transform(X_live)
+            
+            # 3. Predecir la probabilidad de subida
+            # predict_proba retorna [[Probabilidad_0 (baja), Probabilidad_1 (sube)]]
+            probabilities = ML_MODEL.predict_proba(X_live_scaled)[0]
+            prob_buy = probabilities[1]
+            
+            # 4. Decisión basada en el umbral
+            signal = 'HOLD'
+            if prob_buy >= MODEL_CONFIDENCE_THRESHOLD:
+                signal = 'BUY'
+            elif prob_buy <= (1 - MODEL_CONFIDENCE_THRESHOLD): # Umbral para la venta (bajada)
+                signal = 'SELL' 
+                
+            last_close = df_with_indicators['Close'].iloc[-1]
+            log_message = f"{symbol} | Señal: {signal} (Probabilidad Buy: {prob_buy:.4f}) | Precio: {last_close:.4f} | Funding Rate: {funding_rate:.5f}"
+            logger.info(log_message)
+            
+            # Guardar el estado
+            APP_STATE['symbol_data'][symbol] = {
+                'last_signal': signal,
+                'last_price': last_close,
+                'confidence': prob_buy,
+                'funding_rate': funding_rate,
+                'used_ml': True
+            }
+            
+            return signal, last_close, prob_buy
+
+        except Exception as e:
+            # Si el ML falla por cualquier motivo (ej: error en la data, escalador)
+            logger.error(f"❌ FALLO DE ML para {symbol}: {e}. Volviendo a la Lógica Manual (Puntaje).")
+            APP_STATE['model_ready'] = False # Forzar el re-entrenamiento en el siguiente ciclo si es necesario
+            # Continuar con el código de Lógica Manual (Paso 2)
+            pass
+
+    # 2. LOGICA MANUAL (Fallback si el ML no está listo o falló)
+    if not APP_STATE['model_ready']:
         
-        # Precio de la última vela
-        current_price = data['Close'].iloc[-1]
+        # 1. Calcular Indicadores (incluye el Funding Rate actual)
+        df_with_indicators = calculate_indicators(data, funding_rate)
+
+        if df_with_indicators is None:
+            logger.critical(f"❌ {symbol}: No se obtuvieron datos suficientes, saltando análisis manual.")
+            return 'HOLD', None, 0.0
+
+        latest = df_with_indicators.iloc[-1]
+        score = 0.0
+        signal = 'HOLD'
         
-        # Funding Rate
-        funding_rate = data['FundingRate'].iloc[-1]
+        # Reglas Manuales (Puntuación de la Fase 1)
         
-        # Actualizar estado global
-        state['symbol_data'][symbol] = {
+        # Regla 1: RSI - Momentum
+        if latest['RSI'] < 30: # Sobreventa
+            score += 1.5 # Fuerte señal de compra
+        elif latest['RSI'] > 70: # Sobrecompra
+            score -= 1.5 # Fuerte señal de venta
+
+        # Regla 2: Cruce de MACD (Hist > 0 para Buy, Hist < 0 para Sell)
+        if latest['Hist'] > 0:
+            score += 1.0
+        elif latest['Hist'] < 0:
+            score -= 1.0
+
+        # Regla 3: Posición respecto a la EMA50 (Tendencia)
+        if latest['Close'] > latest['EMA50']:
+            score += 0.5
+        elif latest['Close'] < latest['EMA50']:
+            score -= 0.5
+
+        # Regla 4: Funding Rate (Sesgo de la Tasa de Financiación)
+        if funding_rate < -0.0001: # Tasa muy negativa (más gente shorteando -> Buy)
+            score += 1.0
+        elif funding_rate > 0.0001: # Tasa muy positiva (más gente comprando -> Sell)
+            score -= 1.0
+        
+        # Decisión final
+        if score >= 2.0:
+            signal = 'BUY'
+        elif score <= -2.0:
+            signal = 'SELL'
+            
+        last_close = latest['Close']
+        log_message = f"{symbol} | Señal: {signal} (Puntaje: {score:.1f}) | Precio: {last_close:.4f} | Funding Rate: {funding_rate:.5f}"
+        logger.info(log_message)
+        
+        # Guardar el estado
+        APP_STATE['symbol_data'][symbol] = {
             'last_signal': signal,
-            'prob_buy': float(f'{prob_buy:.4f}'),
-            'current_price': float(f'{current_price:.4f}'),
-            'funding_rate': float(f'{funding_rate:.5f}'),
-            'last_signal_time': datetime.utcnow().isoformat()
+            'last_price': last_close,
+            'confidence': score,
+            'funding_rate': funding_rate,
+            'used_ml': False
         }
         
-        logging.info(f"📈 {symbol} | Señal: {signal} (Probabilidad Buy: {prob_buy:.4f}) | Precio: {current_price:.4f} | Funding Rate: {funding_rate:.5f}")
+        return signal, last_close, score
 
-        # Ejecutar Trading (Solo si no es HOLD y estamos en DRY_RUN)
-        if signal != "HOLD" and state['current_mode'] == 'DRY_RUN':
-            execute_simulated_trade(symbol, signal, current_price)
+# ----------------------------------------------------------------------------------
+# BUCLE PRINCIPAL DE EJECUCIÓN
+# ----------------------------------------------------------------------------------
 
-    except Exception as e:
-        logging.error(f"❌ Error al obtener datos o calcular indicadores para {symbol}: {e}")
-
-def execute_simulated_trade(symbol, signal, price):
-    """Ejecuta una orden simulada y actualiza el balance virtual."""
+def run_trading_bot():
+    """Bucle principal del bot de trading."""
     
-    # Calcular tamaño de la orden (usando el límite de capital)
-    order_size_usd = state['initial_capital'] * state['limit_percent']
-    quantity = order_size_usd / price
-
-    if signal == "BUY":
-        logging.info(f"💰 {symbol} - BUY (Simulado): Compraría {quantity:.2f} {symbol.replace('USDT', '')} a {price:.4f} USD. (Costo: {order_size_usd:.2f})")
-        # Simular impacto en el balance (esto es muy simple y no maneja posiciones abiertas)
-        state['balances']['free_USDT'] -= order_size_usd 
-        state['balances']['total_USDT'] = state['balances']['free_USDT'] # Mantener simple por ahora
-    elif signal == "SELL":
-        logging.info(f"🔴 {symbol} - SELL (Simulado): Vendería {quantity:.2f} {symbol.replace('USDT', '')} a {price:.4f} USD. (Ganancia/Pérdida no calculada en simulación simple)")
-        # Dejamos la gestión de riesgo más compleja para la Fase 3
-        state['balances']['free_USDT'] += order_size_usd
-        state['balances']['total_USDT'] = state['balances']['free_USDT']
-
-
-def update_balances():
-    """Actualiza el balance de la cuenta (Simulado)."""
-    # En DRY_RUN o Testnet, solo inicializamos un balance ficticio
-    if state['current_mode'] == 'DRY_RUN' or 'TESTNET' in client.base_url:
-        if state['balances']['free_USDT'] == 0.0:
-            state['balances']['free_USDT'] = state['initial_capital']
-            state['balances']['total_USDT'] = state['initial_capital']
-            logging.info(f"Balances iniciales cargados en el estado. USDT disponible: {state['balances']['free_USDT']:.2f}")
-        else:
-            logging.info(f"Balances de la cuenta actualizados (SIMULACIÓN). USDT disponible: {state['balances']['free_USDT']:.2f}")
-    else:
-        # Lógica para obtener el balance REAL (omitida por seguridad y enfoque en ML)
-        logging.warning("El bot está en modo REAL pero la función de balance real no está implementada.")
-
-
-def trading_cycle():
-    """Bucle principal de ejecución del bot."""
-    logging.info(f"Bot iniciado en modo: {state['current_mode']}.")
-    logging.info(f"Vigilando: {', '.join(state['monitored_symbols'])}")
+    # 1. Inicialización de Conexión
+    client = initialize_client()
     
-    # Inicialización del modelo ML
-    if not state['is_ml_ready']:
-        # Solo entrenamos con el primer símbolo como base
-        initialize_ml_model(state['monitored_symbols'][0]) 
+    # 2. Inicialización de Machine Learning (Entrenamiento si no está cargado)
+    if not APP_STATE['model_ready']:
+        # Este paso usará las claves de Producción para descargar la data histórica
+        initialize_ml_model(client)
 
-    update_balances()
-
-    while state['is_running']:
-        start_time = time.time()
-        
-        # Usamos ThreadPoolExecutor para obtener datos y calcular en paralelo
-        with ThreadPoolExecutor(max_workers=len(state['monitored_symbols'])) as executor:
-            future_to_symbol = {executor.submit(get_binance_data, symbol, state['interval'], 300): symbol for symbol in state['monitored_symbols']}
+    # El bucle del bot
+    while True:
+        try:
+            logger.info(f"Ciclo de trading iniciado.")
             
-            for future in future_to_symbol:
-                symbol = future_to_symbol[future]
-                try:
-                    data = future.result()
-                    update_symbol_state(symbol, data)
-                except Exception as exc:
-                    logging.error(f"❌ Error al procesar {symbol}: {exc}")
+            # Obtener balance actualizado (simulado)
+            logger.info(f"Balances de la cuenta actualizados ({'SIMULACIÓN' if APP_STATE['dry_run'] else 'REAL'}). USDT disponible: {APP_STATE['balances']['free_USDT']:.2f}")
 
-        # Marcar la hora de ejecución
-        state['last_run_utc'] = datetime.utcnow().isoformat()
-        
-        update_balances()
+            # 3. Iterar sobre todos los pares
+            for symbol in SYMBOL_PAIRS:
+                
+                # Obtener data y funding rate
+                logger.info(f"Obteniendo datos de velas para {symbol} en intervalo {INTERVAL}...")
+                data = get_binance_data(client, symbol, INTERVAL, LOOKBACK_PERIOD)
+                funding_rate = get_funding_rate(client, symbol)
+                
+                if data.empty:
+                    logger.error(f"Error INESPERADO en el ciclo de trading: No se pudieron obtener datos, saltando ciclo.")
+                    continue
 
-        end_time = time.time()
-        elapsed_time = end_time - start_time
-        sleep_time = max(0, TRADE_INTERVAL_SECONDS - elapsed_time)
-        
-        logging.info(f"Ciclo completado para todos los pares. Volviendo a dormir por {int(sleep_time)} segundos.")
-        time.sleep(sleep_time)
+                # Tomar decisión (ML o Manual)
+                signal, close_price, confidence = make_decision(data, symbol, funding_rate)
 
+                # TODO: FASE 3: Aquí se implementará la lógica de gestión de riesgo y ejecución de órdenes
 
-# --- Flask Web Server (Para mantener vivo el bot) ---
+            logger.info(f"Ciclo completado para todos los pares. Volviendo a dormir por {CYCLE_DELAY_SECONDS} segundos.")
+            APP_STATE['last_run_utc'] = datetime.utcnow().isoformat()
+            time.sleep(CYCLE_DELAY_SECONDS)
+
+        except BinanceAPIException as e:
+            logger.error(f"Error de API de Binance: {e}. Esperando {CYCLE_DELAY_SECONDS} segundos.")
+            time.sleep(CYCLE_DELAY_SECONDS)
+        except Exception as e:
+            logger.critical(f"Error CRÍTICO e inesperado en el bucle principal: {e}. Reiniciando en 30 segundos.")
+            time.sleep(30)
+
+# ----------------------------------------------------------------------------------
+# ENDPOINTS WEB (Requerido por Render para mantener el bot activo)
+# ----------------------------------------------------------------------------------
+from flask import Flask, jsonify
+app = Flask(__name__)
 
 @app.route('/state', methods=['GET'])
 def get_state():
-    """Devuelve el estado actual del bot como JSON."""
-    return jsonify({
-        'status': 'Running' if state['is_running'] else 'Stopped',
-        'current_state': state
-    })
+    """Endpoint para obtener el estado actual del bot (usado por el monitor de ping)."""
+    
+    # Formatear datos para el JSON
+    state_data = {
+        'status': 'RUNNING',
+        'dry_run_mode': APP_STATE['dry_run'],
+        'model_ml_ready': APP_STATE['model_ready'],
+        'last_run_utc': APP_STATE['last_run_utc'],
+        'balances': {
+            'free_USDT': APP_STATE['balances']['free_USDT'],
+        },
+        'symbol_data': APP_STATE['symbol_data'],
+        'open_positions': APP_STATE['open_positions'],
+    }
+    return jsonify(current_state=state_data)
 
-def run_flask():
-    """Ejecuta el servidor Flask."""
-    # Usamos Threading si es necesario, pero gunicorn lo maneja bien
-    logging.info("Servicio Flask iniciado.")
-    # El puerto 8080 es el estándar de Render
-    app.run(host='0.0.0.0', port=os.environ.get('PORT', 8080))
+@app.route('/', methods=['GET'])
+def home():
+    """Endpoint de bienvenida."""
+    return jsonify(message="Trading Bot Activo. Accede a /state para ver el estado.")
 
-
-# --- Inicio del Bot ---
+# ----------------------------------------------------------------------------------
+# ARRANQUE
+# ----------------------------------------------------------------------------------
 
 if __name__ == '__main__':
-    # Inicializar y correr el ciclo de trading en un hilo separado
-    trading_thread = Thread(target=trading_cycle)
+    # El thread de trading inicia en segundo plano, la app web en primer plano
+    import threading
+    trading_thread = threading.Thread(target=run_trading_bot)
+    trading_thread.daemon = True
     trading_thread.start()
-    logging.info("Hilo de trading iniciado con éxito en segundo plano.")
     
-    # Iniciar Flask en el hilo principal (lo requiere Gunicorn/Render)
-    app.run(host='0.0.0.0', port=os.environ.get('PORT', 8080))
+    # Gunicorn ejecutará 'gunicorn trading_bot:app', usando la variable 'app'
+    # Esta parte solo corre si ejecutas el archivo directamente (p.ej. python trading_bot.py)
+    # En Render, esto es manejado por el Procfile (web: gunicorn trading_bot:app)
+    # app.run(host='0.0.0.0', port=os.environ.get('PORT', 10000))
 
-# Para Gunicorn
-# NOTA: Gunicorn requiere que la aplicación Flask se llame 'app' en el nivel superior del módulo.
-# Esto ya está hecho: app = Flask(__name__)
-# El Procfile debe ser: web: gunicorn trading_bot:app
