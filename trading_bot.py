@@ -167,17 +167,17 @@ def get_binance_data(client, symbol, interval, lookback):
             data['Low'] = pd.to_numeric(data['Low'])
             data['open_time'] = pd.to_datetime(data['open_time'], unit='ms')
             
-            # --- CORRECCIÓN MEJORADA: Asegurar unicidad antes de indexar ---
-            # Si hay duplicados en 'open_time', mantenemos el último (el más reciente)
+            # Asegurar unicidad ANTES de establecer el índice.
             duplicates_before = data.duplicated(subset=['open_time']).sum()
             if duplicates_before > 0:
+                # Mantenemos el último (el más reciente)
                 data.drop_duplicates(subset=['open_time'], keep='last', inplace=True)
                 logger.warning(f"Se eliminaron {duplicates_before} filas duplicadas por 'open_time' para {symbol}.")
             
             # Establecer el índice de tiempo
             data.set_index('open_time', inplace=True)
             
-            return data[['Open', 'High', 'Low', 'Low', 'Close']].iloc[:-1] # Excluye la vela actual incompleta
+            return data[['Open', 'High', 'Low', 'Close']].iloc[:-1] # Excluye la vela actual incompleta
             
         except BinanceAPIException as e:
             # Manejar errores temporales de la API, especialmente comunes en Testnet (ej: 500)
@@ -250,7 +250,6 @@ def calculate_ml_features(df):
     features_row = df.iloc[-1].copy()
     
     # Asegurarse de que las columnas necesarias para X estén calculadas
-    # Estas son las que se usan en initialize_ml_model
     # Las columnas Distancia_EMA50 y Volatilidad se calculan aquí antes de usarlas
     df['Distancia_EMA50'] = (df['Close'] - df['EMA50']) / df['Close']
     df['Volatilidad'] = (df['High'] - df['Low']) / df['Close']
@@ -293,6 +292,16 @@ def initialize_ml_model(client):
 
         df_train = create_target_variable(df)
         
+        # --- VERIFICACIÓN DE LIMPIEZA ADICIONAL Y FORZADA DEL ÍNDICE ANTES DE SKLEARN ---
+        # Este es el cambio más crítico para resolver el error de reindexación persistente.
+        
+        duplicates_in_index = df_train.index.duplicated().sum()
+        if duplicates_in_index > 0:
+            df_train = df_train[~df_train.index.duplicated(keep='last')]
+            logger.warning(f"FORZANDO LIMPIEZA: Se eliminaron {duplicates_in_index} índices duplicados del DataFrame de entrenamiento.")
+        
+        # -------------------------------------------------------------------------------
+
         feature_cols = ['RSI', 'Distancia_EMA50', 'Hist', 'FundingRate', 'Volatilidad']
         
         # Asegurar que estas columnas existan antes de usarlas como features
