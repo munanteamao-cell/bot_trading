@@ -167,11 +167,14 @@ def get_binance_data(client, symbol, interval, lookback):
             data['Low'] = pd.to_numeric(data['Low'])
             data['open_time'] = pd.to_datetime(data['open_time'], unit='ms')
             
-            # --- CORRECCIÓN FINAL: Asegurar la unicidad antes de indexar o cualquier otra operación ---
-            # Esto previene el error 'cannot reindex on an axis with duplicate labels'
-            # Mover esta línea aquí garantiza que no haya duplicados ANTES de set_index.
-            data.drop_duplicates(subset=['open_time'], keep='last', inplace=True)
+            # --- CORRECCIÓN MEJORADA: Asegurar unicidad antes de indexar ---
+            # Si hay duplicados en 'open_time', mantenemos el último (el más reciente)
+            duplicates_before = data.duplicated(subset=['open_time']).sum()
+            if duplicates_before > 0:
+                data.drop_duplicates(subset=['open_time'], keep='last', inplace=True)
+                logger.warning(f"Se eliminaron {duplicates_before} filas duplicadas por 'open_time' para {symbol}.")
             
+            # Establecer el índice de tiempo
             data.set_index('open_time', inplace=True)
             
             return data[['Open', 'High', 'Low', 'Low', 'Close']].iloc[:-1] # Excluye la vela actual incompleta
@@ -248,6 +251,7 @@ def calculate_ml_features(df):
     
     # Asegurarse de que las columnas necesarias para X estén calculadas
     # Estas son las que se usan en initialize_ml_model
+    # Las columnas Distancia_EMA50 y Volatilidad se calculan aquí antes de usarlas
     df['Distancia_EMA50'] = (df['Close'] - df['EMA50']) / df['Close']
     df['Volatilidad'] = (df['High'] - df['Low']) / df['Close']
     
