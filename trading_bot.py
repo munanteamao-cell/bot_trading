@@ -5,11 +5,12 @@ import os
 import time
 import json
 import logging
+import math # Importar math para floor/ceil para redondear cantidad
 from datetime import datetime, timedelta
 
 # Librerías de Trading
 from binance.client import Client
-from binance.exceptions import BinanceAPIException
+from binance.exceptions import BinanceAPIException, BinanceRequestException
 from binance.enums import *
 
 # Librerías de Análisis y Machine Learning
@@ -48,12 +49,16 @@ APP_STATE = {
     'open_positions': {}, # {'TRXUSDT': {'entry_price': 0.35, 'side': 'LONG', 'quantity': 1000, 'sl': 0.348, 'tp': 0.355}}
     'model_ready': False,
     'last_run_utc': None,
-    'symbol_data': {}
+    'symbol_data': {},
+    'symbol_precision': {} # Almacenar precisiones para evitar el error 'stepSize'
 }
 
 # Variable para el modelo ML y el escalador, se cargan al inicio
 ML_MODEL = None
 SCALER = None
+
+# Variable para el cliente de Binance
+BINANCE_CLIENT = None
 
 # Configuración de Logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)s | %(message)s')
@@ -83,6 +88,7 @@ def initialize_client():
             client.futures_base_url = FUTURES_TESTNET_URL
             # Intentar configurar apalancamiento y modo de margen (solo para Testnet)
             try:
+                # Configuramos un par de ejemplo para inicializar la conexión.
                 client.futures_change_leverage(symbol='BTCUSDT', leverage=LEVERAGE)
                 client.futures_change_margin_type(symbol='BTCUSDT', marginType='ISOLATED')
             except Exception as e:
@@ -100,12 +106,38 @@ def initialize_client():
         logger.critical(f"❌ Error al inicializar el cliente de Binance: {e}")
         logger.warning("Forzando modo DRY_RUN debido a error de conexión o credenciales.")
         APP_STATE['dry_run'] = True
-        return Client(API_KEY, API_SECRET) 
+        # Devuelve un cliente que probablemente fallará en cualquier llamada real, pero permite que el código siga.
+        return Client(API_KEY, API_SECRET)
+
+def load_symbol_precision(client):
+    """Obtiene y almacena la precisión de cantidad y precio para cada símbolo."""
+    global APP_STATE
+    
+    try:
+        exchange_info = client.futures_exchange_info()
+        for symbol_data in exchange_info['symbols']:
+            if symbol_data['symbol'] in SYMBOL_PAIRS:
+                precision = {
+                    'price': symbol_data['pricePrecision'],
+                    'quantity': symbol_data['quantityPrecision']
+                }
+                APP_STATE['symbol_precision'][symbol_data['symbol']] = precision
+                
+        if APP_STATE['symbol_precision']:
+            logger.info(f"✅ Precisiones de {len(APP_STATE['symbol_precision'])} símbolos cargadas.")
+            
+    except Exception as e:
+        logger.warning(f"Error al obtener info de exchange (precisiones): {e}. Usando precisión por defecto (3/4 decimales).")
+        # Usar valores predeterminados de seguridad si la API falla
+        for symbol in SYMBOL_PAIRS:
+            APP_STATE['symbol_precision'][symbol] = {'price': 4, 'quantity': 3}
+
 
 def get_funding_rate(client, symbol):
     """Obtiene la última tasa de funding rate para un símbolo."""
     try:
         # Se requiere la API de Producción para este endpoint, Testnet no lo tiene.
+        # En Testnet, esto fallará, por lo que devolvemos 0.0
         rate_info = client.futures_funding_rate(symbol=symbol)
         return float(rate_info[0]['fundingRate']) if rate_info else 0.0
     except Exception as e:
@@ -113,33 +145,44 @@ def get_funding_rate(client, symbol):
         return 0.0
 
 def get_binance_data(client, symbol, interval, lookback):
-    """Descarga velas históricas y las formatea como DataFrame."""
-    try:
-        # Descarga la data histórica
-        klines = client.futures_historical_klines(symbol, interval, lookback)
-        
-        # Formatea a DataFrame
-        data = pd.DataFrame(klines, columns=[
-            'open_time', 'Open', 'High', 'Low', 'Close', 'Volume', 
-            'close_time', 'quote_asset_volume', 'number_of_trades', 
-            'taker_buy_base_asset_volume', 'taker_buy_quote_asset_volume', 'ignore'
-        ])
-        
-        # Limpieza y preparación de columnas
-        data['Close'] = pd.to_numeric(data['Close'])
-        data['Open'] = pd.to_numeric(data['Open'])
-        data['High'] = pd.to_numeric(data['High'])
-        data['Low'] = pd.to_numeric(data['Low'])
-        data['open_time'] = pd.to_datetime(data['open_time'], unit='ms')
-        data.set_index('open_time', inplace=True)
-        
-        return data[['Open', 'High', 'Low', 'Close']].iloc[:-1] # Excluye la vela actual incompleta
-    except BinanceAPIException as e:
-        logger.error(f"Error de API al obtener datos para {symbol}: {e}")
-        return pd.DataFrame()
-    except Exception as e:
-        logger.error(f"Error inesperado al obtener datos para {symbol}: {e}")
-        return pd.DataFrame()
+    """Descarga velas históricas y las formatea como DataFrame, con reintentos."""
+    MAX_RETRIES = 5
+    for attempt in range(MAX_RETRIES):
+        try:
+            # Descarga la data histórica
+            klines = client.futures_historical_klines(symbol, interval, lookback)
+            
+            # Formatea a DataFrame
+            data = pd.DataFrame(klines, columns=[
+                'open_time', 'Open', 'High', 'Low', 'Close', 'Volume', 
+                'close_time', 'quote_asset_volume', 'number_of_trades', 
+                'taker_buy_base_asset_volume', 'taker_buy_quote_asset_volume', 'ignore'
+            ])
+            
+            # Limpieza y preparación de columnas
+            data['Close'] = pd.to_numeric(data['Close'])
+            data['Open'] = pd.to_numeric(data['Open'])
+            data['High'] = pd.to_numeric(data['High'])
+            data['Low'] = pd.to_numeric(data['Low'])
+            data['open_time'] = pd.to_datetime(data['open_time'], unit='ms')
+            data.set_index('open_time', inplace=True)
+            
+            return data[['Open', 'High', 'Low', 'Low', 'Close']].iloc[:-1] # Excluye la vela actual incompleta
+            
+        except BinanceAPIException as e:
+            # Manejar errores temporales de la API, especialmente comunes en Testnet (ej: 500)
+            logger.warning(f"Error TEMPORAL (Intento {attempt + 1}/{MAX_RETRIES}) al obtener datos para {symbol}: {e}.")
+            if attempt + 1 == MAX_RETRIES:
+                logger.critical(f"Error CRÍTICO y persistente al obtener datos para {symbol} después de {MAX_RETRIES} intentos. Saltando el par.")
+                return pd.DataFrame()
+            
+            wait_time = 2 ** attempt # Retroceso exponencial: 1s, 2s, 4s, 8s
+            logger.warning(f"Reintentando en {wait_time} segundos.")
+            time.sleep(wait_time)
+            
+        except Exception as e:
+            logger.error(f"Error inesperado al obtener datos para {symbol}: {e}")
+            return pd.DataFrame()
 
 def calculate_indicators(data, funding_rate):
     """Calcula indicadores técnicos (RSI, EMA, MACD, etc.)."""
@@ -223,10 +266,11 @@ def initialize_ml_model(client):
     symbol = 'BTCUSDT'
     logger.info(f"Buscando datos históricos de {symbol} por {LOOKBACK_PERIOD}...")
     
+    # Usar get_binance_data, que ahora tiene reintentos
     data = get_binance_data(client, symbol, INTERVAL, LOOKBACK_PERIOD)
     
     if data.empty:
-        logger.critical("❌ NO SE PUDO DESCARGAR DATA HISTÓRICA para entrenamiento. El bot usará el modo DRY_RUN con Lógica Manual.")
+        logger.critical("❌ NO SE PUDO DESCARGAR DATA HISTÓRICA para entrenamiento. El bot usará la Lógica Manual.")
         return
 
     funding_rate = get_funding_rate(client, symbol) # Usar el funding rate más reciente
@@ -262,9 +306,14 @@ def initialize_ml_model(client):
     APP_STATE['model_ready'] = True
     logger.info(f"✅ Modelo ML cargado en memoria exitosamente. Precisión (entrenamiento): {accuracy:.4f}")
 
-# ----------------------------------------------------------------------------------
-# LOGICA DE TRADING Y EJECUCION DE ÓRDENES (Fase 3)
-# ----------------------------------------------------------------------------------
+# Función auxiliar para redondear una cantidad a la precisión requerida
+def round_quantity_by_precision(quantity, precision):
+    """Redondea la cantidad al número de decimales especificado."""
+    if precision <= 0:
+        return math.floor(quantity)
+    # Redondear hacia abajo (floor) para asegurar que no excedamos el margen
+    multiplier = 10 ** precision
+    return math.floor(quantity * multiplier) / multiplier
 
 def execute_order(client, symbol, signal, close_price, confidence):
     """Gestiona la apertura de una nueva posición si no hay una abierta."""
@@ -289,11 +338,18 @@ def execute_order(client, symbol, signal, close_price, confidence):
     nocional_value = capital_to_use * LEVERAGE
     
     # Cantidad (quantity) a comprar/vender (en unidades del activo base, ej: BTC, TRX)
-    quantity = nocional_value / close_price
+    raw_quantity = nocional_value / close_price
     
-    # Redondear la cantidad a la precisión necesaria (usaremos 3 decimales)
-    quantity = round(quantity, 3)
+    # Redondear la cantidad a la precisión necesaria
+    # Usamos la precisión cargada o un valor por defecto seguro (3 decimales)
+    qty_precision = APP_STATE['symbol_precision'].get(symbol, {}).get('quantity', 3)
+    quantity = round_quantity_by_precision(raw_quantity, qty_precision)
     
+    # Aseguramos que la cantidad no sea cero después del redondeo
+    if quantity <= 0:
+        logger.warning(f"{symbol}: Cantidad calculada ({raw_quantity:.8f}) se redondeó a cero. Saltando orden.")
+        return
+
     # Definir Side y Stop/Take Profit
     if signal == 'BUY':
         side = SIDE_BUY
@@ -304,11 +360,12 @@ def execute_order(client, symbol, signal, close_price, confidence):
         sl_price = close_price * (1 + STOP_LOSS_PCT)
         tp_price = close_price * (1 - TAKE_PROFIT_PCT)
 
-    # Redondear precios SL/TP a 4 decimales
-    sl_price = round(sl_price, 4)
-    tp_price = round(tp_price, 4)
+    # Redondear precios SL/TP a la precisión de precio
+    price_precision = APP_STATE['symbol_precision'].get(symbol, {}).get('price', 4)
+    sl_price = round(sl_price, price_precision)
+    tp_price = round(tp_price, price_precision)
     
-    logger.info(f"💰 {symbol}: Intentando {signal} (CONF: {confidence:.2f}) - {quantity:.3f} unidades. SL: {sl_price:.4f} / TP: {tp_price:.4f}")
+    logger.info(f"💰 {symbol}: Intentando {signal} (CONF: {confidence:.2f}) - {quantity:.{qty_precision}f} unidades. SL: {sl_price:.{price_precision}f} / TP: {tp_price:.{price_precision}f}")
 
     if APP_STATE['dry_run']:
         # SIMULACIÓN
@@ -331,6 +388,7 @@ def execute_order(client, symbol, signal, close_price, confidence):
         # EJECUCIÓN REAL (No implementado en esta fase por seguridad)
         logger.warning("🔴 EJECUCIÓN REAL: No implementada en esta fase por seguridad. Ejecutando DRY_RUN.")
         # Aquí iría la lógica real de client.futures_create_order()
+
 
 def manage_positions(symbol, current_price):
     """Verifica SL/TP y cierra posiciones abiertas en el estado simulado."""
@@ -362,6 +420,9 @@ def manage_positions(symbol, current_price):
         # Si el precio sube al TP
         gain_pct = TAKE_PROFIT_PCT * LEVERAGE 
         profit_loss = position['margin_used'] * (gain_pct / RISK_PER_TRADE) * RISK_PER_TRADE # Ganancia real sobre el margen
+        # Se necesita ajustar el cálculo de P/L de simulación, esto es una aproximación
+        # P/L = (Cierre - Entrada) * Cantidad * Palanca
+        # Para simulación simple, mantenemos la aproximación basada en el margen
         logger.info(f"🎉 {symbol}: ¡TAKE-PROFIT HIT! Precio actual ({current_price:.4f}) >= TP ({position['tp']:.4f}). Ganancia simulada: {profit_loss:.2f} USDT.")
         position_closed = True
     elif position['side'] == 'SELL' and current_price <= position['tp']:
@@ -394,6 +455,7 @@ def make_decision(data, symbol, funding_rate):
     confidence = 0.0
 
     # 1. LOGICA ML
+    # Solo intentar si el modelo está marcado como listo
     if APP_STATE['model_ready'] and ML_MODEL is not None and SCALER is not None:
         try:
             df_with_indicators = calculate_indicators(data, funding_rate)
@@ -431,7 +493,7 @@ def make_decision(data, symbol, funding_rate):
             }
 
         except Exception as e:
-            logger.error(f"❌ FALLO DE ML para {symbol}: {e}. Volviendo a la Lógica Manual.")
+            logger.error(f"❌ FALLO DE ML para {symbol}: {e}. Volviendo a la Lógica Manual y marcando el modelo como NO listo.")
             APP_STATE['model_ready'] = False 
             # Si el ML falla, el código continua con la lógica manual (Paso 2)
             
@@ -485,60 +547,72 @@ def make_decision(data, symbol, funding_rate):
 
 def run_trading_bot():
     """Bucle principal del bot de trading."""
-    
-    client = initialize_client()
-    
-    if not APP_STATE['model_ready']:
-        initialize_ml_model(client)
+    global BINANCE_CLIENT
+
+    # 1. COMPROBAR CLIENTE (Debe estar inicializado)
+    if BINANCE_CLIENT is None:
+        logger.critical("Error: El cliente de Binance no fue inicializado correctamente al inicio. Terminando hilo de trading.")
+        return
 
     while True:
         try:
             logger.info(f"--- Ciclo de trading iniciado. ---")
+
+            # 2. INTENTO DE INICIALIZACIÓN DE ML (Se ejecuta si el modelo no está listo)
+            # Esto permite que el modelo se entrene en el fondo sin bloquear el arranque web.
+            if not APP_STATE['model_ready']:
+                initialize_ml_model(BINANCE_CLIENT)
+                # Si falla, simplemente se usará la lógica manual en este ciclo.
             
             logger.info(f"Balances de la cuenta ({'SIMULACIÓN' if APP_STATE['dry_run'] else 'REAL'}). USDT libre: {APP_STATE['balances']['free_USDT']:.2f}")
 
             # 3. Iterar sobre todos los pares
             for symbol in SYMBOL_PAIRS:
                 
-                logger.info(f"Procesando {symbol}...")
-                data = get_binance_data(client, symbol, INTERVAL, LOOKBACK_PERIOD)
-                funding_rate = get_funding_rate(client, symbol)
-                
-                if data.empty:
-                    logger.error(f"Error: No se pudieron obtener datos para {symbol}, saltando ciclo.")
-                    continue
-
-                # Tomar decisión (ML o Manual)
-                signal, close_price, confidence = make_decision(data, symbol, funding_rate)
-
-                if close_price is None:
-                    continue # No data, no decision
-
-                # 4. GESTIÓN DE POSICIONES ABIERTAS (Stop Loss / Take Profit)
-                position_closed = manage_positions(symbol, close_price)
-                
-                # 5. EJECUCIÓN DE NUEVAS ÓRDENES (Solo si no se cerró una posición en este ciclo)
-                if not position_closed:
-                    # Usamos un umbral de confianza/puntaje mínimo (se usa el mismo que MODEL_CONFIDENCE_THRESHOLD)
-                    # En modo ML, el umbral es 0.55. En modo Manual, es 2.0 (por el puntaje)
-                    min_confidence = MODEL_CONFIDENCE_THRESHOLD if APP_STATE['model_ready'] else 2.0
+                # Envoltura de try/except para aislar errores por símbolo y no detener el bot
+                try:
+                    logger.info(f"Procesando {symbol}...")
+                    data = get_binance_data(BINANCE_CLIENT, symbol, INTERVAL, LOOKBACK_PERIOD)
+                    funding_rate = get_funding_rate(BINANCE_CLIENT, symbol)
                     
-                    if confidence >= min_confidence:
-                        # Si la señal es fuerte y no hay posición abierta, ejecutar orden
-                        execute_order(client, symbol, signal, close_price, confidence)
-                    elif symbol in APP_STATE['open_positions']:
-                        # Si ya hay una posición, solo monitorear (no hay señal de reversión fuerte)
-                        logger.info(f"{symbol}: Posición activa. Esperando SL/TP.")
+                    if data.empty:
+                        logger.error(f"Error: No se pudieron obtener datos para {symbol}, saltando análisis.")
+                        continue
+
+                    # Tomar decisión (ML o Manual)
+                    signal, close_price, confidence = make_decision(data, symbol, funding_rate)
+
+                    if close_price is None:
+                        continue # No data, no decision
+
+                    # 4. GESTIÓN DE POSICIONES ABIERTAS (Stop Loss / Take Profit)
+                    position_closed = manage_positions(symbol, close_price)
+                    
+                    # 5. EJECUCIÓN DE NUEVAS ÓRDENES (Solo si no se cerró una posición en este ciclo)
+                    if not position_closed:
+                        # Usamos un umbral de confianza/puntaje mínimo (se usa el mismo que MODEL_CONFIDENCE_THRESHOLD)
+                        min_confidence = MODEL_CONFIDENCE_THRESHOLD if APP_STATE['model_ready'] else 2.0
+                        
+                        if confidence >= min_confidence:
+                            # Si la señal es fuerte y no hay posición abierta, ejecutar orden
+                            execute_order(BINANCE_CLIENT, symbol, signal, close_price, confidence)
+                        elif symbol in APP_STATE['open_positions']:
+                            # Si ya hay una posición, solo monitorear (no hay señal de reversión fuerte)
+                            logger.info(f"{symbol}: Posición activa. Esperando SL/TP.")
+                
+                except BinanceAPIException as e:
+                    # Captura el error 'stepSize' o 'LOT_SIZE' y permite que el bot continúe con el siguiente par.
+                    logger.error(f"❌ Error de API de Binance al procesar {symbol} (Probablemente precisión/stepSize): {e}. El bot continúa con el siguiente par.")
+                except Exception as e:
+                    logger.error(f"❌ Error inesperado al procesar {symbol}: {e}. El bot continúa con el siguiente par.")
 
             
             logger.info(f"--- Ciclo completado. Abiertas: {len(APP_STATE['open_positions'])}. Durmiendo por {CYCLE_DELAY_SECONDS} segundos. ---")
             APP_STATE['last_run_utc'] = datetime.utcnow().isoformat()
             time.sleep(CYCLE_DELAY_SECONDS)
 
-        except BinanceAPIException as e:
-            logger.error(f"Error de API de Binance: {e}. Esperando {CYCLE_DELAY_SECONDS} segundos.")
-            time.sleep(CYCLE_DELAY_SECONDS)
         except Exception as e:
+            # Captura errores que no son específicos de un símbolo (ej: fallo de conexión general)
             logger.critical(f"Error CRÍTICO e inesperado en el bucle principal: {e}. Reiniciando en 30 segundos.")
             time.sleep(30)
 
@@ -578,15 +652,22 @@ def home():
     return jsonify(message="Trading Bot Activo. Accede a /state para ver el estado.")
 
 # ----------------------------------------------------------------------------------
-# ARRANQUE
+# ARRANQUE Y SETUP INICIAL
 # ----------------------------------------------------------------------------------
+
+# 1. Inicializar el cliente de Binance tan pronto como el módulo se cargue
+BINANCE_CLIENT = initialize_client()
+
+# 2. Cargar precisiones (depende del cliente)
+if BINANCE_CLIENT and not APP_STATE['symbol_precision']:
+    load_symbol_precision(BINANCE_CLIENT)
+
 
 if __name__ == '__main__':
     # El thread de trading inicia en segundo plano, la app web en primer plano
     import threading
     
-    # 🚨 AJUSTE DE THREAD: Aseguramos que el thread principal no espere al thread de trading.
-    # Esto es crucial para que Gunicorn/Flask mantenga vivo el servicio web.
+    # AJUSTE DE THREAD: Aseguramos que el thread principal no espere al thread de trading.
     trading_thread = threading.Thread(target=run_trading_bot)
     trading_thread.daemon = True # Esto hace que el hilo muera si el principal muere, que es lo esperado en Render.
     
@@ -594,6 +675,3 @@ if __name__ == '__main__':
     trading_thread.start()
     
     # Gunicorn ejecutará 'gunicorn trading_bot:app', usando la variable 'app'
-    # Esta línea asegura que la aplicación Flask se ejecute en el puerto requerido.
-    # No es necesaria si usas gunicorn directamente, pero ayuda a la estabilidad.
-    # app.run(host='0.0.0.0', port=os.environ.get('PORT', 10000)) 
