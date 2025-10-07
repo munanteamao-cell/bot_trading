@@ -166,6 +166,11 @@ def get_binance_data(client, symbol, interval, lookback):
             data['High'] = pd.to_numeric(data['High'])
             data['Low'] = pd.to_numeric(data['Low'])
             data['open_time'] = pd.to_datetime(data['open_time'], unit='ms')
+            
+            # --- CORRECCIÓN CLAVE: Eliminar filas duplicadas en el tiempo de apertura ---
+            # Esto previene el error 'cannot reindex on an axis with duplicate labels'
+            data.drop_duplicates(subset=['open_time'], keep='last', inplace=True)
+            
             data.set_index('open_time', inplace=True)
             
             return data[['Open', 'High', 'Low', 'Low', 'Close']].iloc[:-1] # Excluye la vela actual incompleta
@@ -494,9 +499,10 @@ def make_decision(data, symbol, funding_rate):
             }
 
         except Exception as e:
-            logger.error(f"❌ FALLO DE ML para {symbol}: {e}. Volviendo a la Lógica Manual y marcando el modelo como NO listo.")
+            # Si el ML falla por cualquier razón, se desactiva y se usa el fallback manual.
+            logger.error(f"❌ FALLO DE ML para {symbol}: {e}. Volviendo a la Lógica Manual.")
             APP_STATE['model_ready'] = False 
-            # Si el ML falla, el código continua con la lógica manual (Paso 2)
+            # El error 'cannot reindex' debería ser manejado aquí, y el bot no debería caer.
             
     # 2. LOGICA MANUAL (Fallback si el ML no está listo o falló)
     if not APP_STATE['model_ready'] or close_price is None:
@@ -562,8 +568,13 @@ def run_trading_bot():
             # 2. INTENTO DE INICIALIZACIÓN DE ML (Se ejecuta si el modelo no está listo)
             # Esto permite que el modelo se entrene en el fondo sin bloquear el arranque web.
             if not APP_STATE['model_ready']:
-                initialize_ml_model(BINANCE_CLIENT)
-                # Si falla, simplemente se usará la lógica manual en este ciclo.
+                # El error de reindexación ocurre AQUI. Usamos un try/except en el bucle
+                # principal para manejar errores que afectan el ciclo completo.
+                try:
+                    initialize_ml_model(BINANCE_CLIENT)
+                except Exception as e:
+                    logger.critical(f"Error CRÍTICO al intentar inicializar el modelo ML: {e}. El bot continuará usando solo la lógica manual.")
+                    APP_STATE['model_ready'] = False
             
             logger.info(f"Balances de la cuenta ({'SIMULACIÓN' if APP_STATE['dry_run'] else 'REAL'}). USDT libre: {APP_STATE['balances']['free_USDT']:.2f}")
 
@@ -614,6 +625,7 @@ def run_trading_bot():
 
         except Exception as e:
             # Captura errores que no son específicos de un símbolo (ej: fallo de conexión general)
+            # El error de reindexación será capturado por el try/except del initialize_ml_model
             logger.critical(f"Error CRÍTICO e inesperado en el bucle principal: {e}. Reiniciando en 30 segundos.")
             time.sleep(30)
 
