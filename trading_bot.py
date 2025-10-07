@@ -92,6 +92,7 @@ def initialize_client():
                 client.futures_change_leverage(symbol='BTCUSDT', leverage=LEVERAGE)
                 client.futures_change_margin_type(symbol='BTCUSDT', marginType='ISOLATED')
             except Exception as e:
+                # El error APIError(code=-2015) es normal aquí si las claves son incorrectas/Testnet no está configurado
                 logger.warning(f"No se pudo configurar apalancamiento/margen en Testnet: {e}")
                 
             logger.info(f"✅ Conectado a Binance TESTNET (SIMULACIÓN).")
@@ -652,8 +653,9 @@ def home():
     return jsonify(message="Trading Bot Activo. Accede a /state para ver el estado.")
 
 # ----------------------------------------------------------------------------------
-# ARRANQUE Y SETUP INICIAL
+# ARRANQUE Y SETUP INICIAL (Asegura que el thread de trading inicie en Gunicorn)
 # ----------------------------------------------------------------------------------
+import threading
 
 # 1. Inicializar el cliente de Binance tan pronto como el módulo se cargue
 BINANCE_CLIENT = initialize_client()
@@ -662,16 +664,14 @@ BINANCE_CLIENT = initialize_client()
 if BINANCE_CLIENT and not APP_STATE['symbol_precision']:
     load_symbol_precision(BINANCE_CLIENT)
 
-
+# 3. INICIAR EL THREAD DE TRADING
+# Se inicia aquí, fuera del bloque if __name__ == '__main__', para que Gunicorn lo ejecute.
+logger.info("⚙️ Iniciando Thread de Trading en segundo plano...")
+trading_thread = threading.Thread(target=run_trading_bot)
+trading_thread.daemon = True # Hace que el hilo se detenga cuando Gunicorn se detenga.
+trading_thread.start()
+    
+# El proceso principal (Gunicorn) usará la variable 'app' para servir las peticiones web.
 if __name__ == '__main__':
-    # El thread de trading inicia en segundo plano, la app web en primer plano
-    import threading
-    
-    # AJUSTE DE THREAD: Aseguramos que el thread principal no espere al thread de trading.
-    trading_thread = threading.Thread(target=run_trading_bot)
-    trading_thread.daemon = True # Esto hace que el hilo muera si el principal muere, que es lo esperado en Render.
-    
-    # Inicia el hilo de trading.
-    trading_thread.start()
-    
-    # Gunicorn ejecutará 'gunicorn trading_bot:app', usando la variable 'app'
+    # Esto solo se usa si ejecutas python trading_bot.py localmente, no en Render.
+    app.run(debug=True, host='0.0.0.0', port=os.environ.get('PORT', 5000))
