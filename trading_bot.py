@@ -167,8 +167,9 @@ def get_binance_data(client, symbol, interval, lookback):
             data['Low'] = pd.to_numeric(data['Low'])
             data['open_time'] = pd.to_datetime(data['open_time'], unit='ms')
             
-            # --- CORRECCIÓN CLAVE: Eliminar filas duplicadas en el tiempo de apertura ---
+            # --- CORRECCIÓN FINAL: Asegurar la unicidad antes de indexar o cualquier otra operación ---
             # Esto previene el error 'cannot reindex on an axis with duplicate labels'
+            # Mover esta línea aquí garantiza que no haya duplicados ANTES de set_index.
             data.drop_duplicates(subset=['open_time'], keep='last', inplace=True)
             
             data.set_index('open_time', inplace=True)
@@ -272,45 +273,51 @@ def initialize_ml_model(client):
     symbol = 'BTCUSDT'
     logger.info(f"Buscando datos históricos de {symbol} por {LOOKBACK_PERIOD}...")
     
-    # Usar get_binance_data, que ahora tiene reintentos
-    data = get_binance_data(client, symbol, INTERVAL, LOOKBACK_PERIOD)
-    
-    if data.empty:
-        logger.critical("❌ NO SE PUDO DESCARGAR DATA HISTÓRICA para entrenamiento. El bot usará la Lógica Manual.")
-        return
+    try:
+        data = get_binance_data(client, symbol, INTERVAL, LOOKBACK_PERIOD)
+        
+        if data.empty:
+            logger.critical("❌ NO SE PUDO DESCARGAR DATA HISTÓRICA para entrenamiento. El bot usará la Lógica Manual.")
+            return
 
-    funding_rate = get_funding_rate(client, symbol) # Usar el funding rate más reciente
-    df = calculate_indicators(data, funding_rate=funding_rate)
-    
-    if df is None or df.empty:
-        logger.critical("❌ Data insuficiente para entrenamiento después de calcular indicadores.")
-        return
+        funding_rate = get_funding_rate(client, symbol) # Usar el funding rate más reciente
+        df = calculate_indicators(data, funding_rate=funding_rate)
+        
+        if df is None or df.empty:
+            logger.critical("❌ Data insuficiente para entrenamiento después de calcular indicadores.")
+            return
 
-    df_train = create_target_variable(df)
-    
-    feature_cols = ['RSI', 'Distancia_EMA50', 'Hist', 'FundingRate', 'Volatilidad']
-    
-    # Asegurar que estas columnas existan antes de usarlas como features
-    df_train['Distancia_EMA50'] = (df_train['Close'] - df_train['EMA50']) / df_train['Close']
-    df_train['Volatilidad'] = (df_train['High'] - df_train['Low']) / df_train['Close']
-    
-    X = df_train[feature_cols].values
-    y = df_train['Target'].values
+        df_train = create_target_variable(df)
+        
+        feature_cols = ['RSI', 'Distancia_EMA50', 'Hist', 'FundingRate', 'Volatilidad']
+        
+        # Asegurar que estas columnas existan antes de usarlas como features
+        df_train['Distancia_EMA50'] = (df_train['Close'] - df_train['EMA50']) / df_train['Close']
+        df_train['Volatilidad'] = (df_train['High'] - df_train['Low']) / df_train['Close']
+        
+        X = df_train[feature_cols].values
+        y = df_train['Target'].values
 
-    if len(X) == 0:
-        logger.critical("❌ No hay suficientes muestras de datos (X) para el entrenamiento.")
-        return
-    
-    SCALER = StandardScaler()
-    X_scaled = SCALER.fit_transform(X)
-    
-    ML_MODEL = LogisticRegression(solver='liblinear', random_state=42)
-    ML_MODEL.fit(X_scaled, y)
-    
-    accuracy = ML_MODEL.score(X_scaled, y)
-    
-    APP_STATE['model_ready'] = True
-    logger.info(f"✅ Modelo ML cargado en memoria exitosamente. Precisión (entrenamiento): {accuracy:.4f}")
+        if len(X) == 0:
+            logger.critical("❌ No hay suficientes muestras de datos (X) para el entrenamiento.")
+            return
+        
+        SCALER = StandardScaler()
+        X_scaled = SCALER.fit_transform(X)
+        
+        ML_MODEL = LogisticRegression(solver='liblinear', random_state=42)
+        ML_MODEL.fit(X_scaled, y)
+        
+        accuracy = ML_MODEL.score(X_scaled, y)
+        
+        APP_STATE['model_ready'] = True
+        logger.info(f"✅ Modelo ML cargado en memoria exitosamente. Precisión (entrenamiento): {accuracy:.4f}")
+
+    except Exception as e:
+        # Esto atrapará el error de reindexación si persistiera
+        logger.critical(f"❌ Error CRÍTICO durante el entrenamiento del modelo ML: {e}. El bot usará la Lógica Manual.")
+        APP_STATE['model_ready'] = False # Asegurar que el estado sea FALSO
+
 
 # Función auxiliar para redondear una cantidad a la precisión requerida
 def round_quantity_by_precision(quantity, precision):
@@ -424,17 +431,20 @@ def manage_positions(symbol, current_price):
     # 2. Comprobar Take-Profit (TP)
     elif position['side'] == 'BUY' and current_price >= position['tp']:
         # Si el precio sube al TP
-        gain_pct = TAKE_PROFIT_PCT * LEVERAGE 
-        profit_loss = position['margin_used'] * (gain_pct / RISK_PER_TRADE) * RISK_PER_TRADE # Ganancia real sobre el margen
-        # Se necesita ajustar el cálculo de P/L de simulación, esto es una aproximación
-        # P/L = (Cierre - Entrada) * Cantidad * Palanca
-        # Para simulación simple, mantenemos la aproximación basada en el margen
+        # P/L = (Precio Cierre - Precio Entrada) * Cantidad
+        # Para simplificación en simulación:
+        profit_loss_pct = (current_price - position['entry_price']) / position['entry_price']
+        profit_loss = position['margin_used'] * (profit_loss_pct * LEVERAGE)
+        
         logger.info(f"🎉 {symbol}: ¡TAKE-PROFIT HIT! Precio actual ({current_price:.4f}) >= TP ({position['tp']:.4f}). Ganancia simulada: {profit_loss:.2f} USDT.")
         position_closed = True
     elif position['side'] == 'SELL' and current_price <= position['tp']:
         # Si el precio cae al TP (short)
-        gain_pct = TAKE_PROFIT_PCT * LEVERAGE
-        profit_loss = position['margin_used'] * (gain_pct / RISK_PER_TRADE) * RISK_PER_TRADE
+        # P/L = (Precio Entrada - Precio Cierre) * Cantidad
+        # Para simplificación en simulación:
+        profit_loss_pct = (position['entry_price'] - current_price) / position['entry_price']
+        profit_loss = position['margin_used'] * (profit_loss_pct * LEVERAGE)
+
         logger.info(f"🎉 {symbol}: ¡TAKE-PROFIT HIT! Precio actual ({current_price:.4f}) <= TP ({position['tp']:.4f}). Ganancia simulada: {profit_loss:.2f} USDT.")
         position_closed = True
         
@@ -502,7 +512,6 @@ def make_decision(data, symbol, funding_rate):
             # Si el ML falla por cualquier razón, se desactiva y se usa el fallback manual.
             logger.error(f"❌ FALLO DE ML para {symbol}: {e}. Volviendo a la Lógica Manual.")
             APP_STATE['model_ready'] = False 
-            # El error 'cannot reindex' debería ser manejado aquí, y el bot no debería caer.
             
     # 2. LOGICA MANUAL (Fallback si el ML no está listo o falló)
     if not APP_STATE['model_ready'] or close_price is None:
@@ -566,15 +575,9 @@ def run_trading_bot():
             logger.info(f"--- Ciclo de trading iniciado. ---")
 
             # 2. INTENTO DE INICIALIZACIÓN DE ML (Se ejecuta si el modelo no está listo)
-            # Esto permite que el modelo se entrene en el fondo sin bloquear el arranque web.
             if not APP_STATE['model_ready']:
-                # El error de reindexación ocurre AQUI. Usamos un try/except en el bucle
-                # principal para manejar errores que afectan el ciclo completo.
-                try:
-                    initialize_ml_model(BINANCE_CLIENT)
-                except Exception as e:
-                    logger.critical(f"Error CRÍTICO al intentar inicializar el modelo ML: {e}. El bot continuará usando solo la lógica manual.")
-                    APP_STATE['model_ready'] = False
+                # initialize_ml_model ahora tiene su propio manejo de excepciones
+                initialize_ml_model(BINANCE_CLIENT)
             
             logger.info(f"Balances de la cuenta ({'SIMULACIÓN' if APP_STATE['dry_run'] else 'REAL'}). USDT libre: {APP_STATE['balances']['free_USDT']:.2f}")
 
@@ -625,7 +628,6 @@ def run_trading_bot():
 
         except Exception as e:
             # Captura errores que no son específicos de un símbolo (ej: fallo de conexión general)
-            # El error de reindexación será capturado por el try/except del initialize_ml_model
             logger.critical(f"Error CRÍTICO e inesperado en el bucle principal: {e}. Reiniciando en 30 segundos.")
             time.sleep(30)
 
