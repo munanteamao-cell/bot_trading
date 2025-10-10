@@ -6,4 +6,5 @@ backtrader
 numpy
 scikit-learn
 joblib
+xgboost
 
