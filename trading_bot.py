@@ -33,7 +33,7 @@ DRY_RUN = os.environ.get('DRY_RUN', 'true').lower() in ('1', 'true', 'yes')
 USE_TESTNET = os.environ.get('USE_TESTNET', 'true').lower() in ('1', 'true', 'yes') # ¡Usamos Testnet para simulación!
 
 # Parámetros de Trading
-SYMBOL_PAIRS = os.environ.get('SYMBOL_PAIRS', 'TRXUSDT,BTCUSDT').split(',') # Pares a vigilar
+SYMBOL_PAIRS = os.environ.get('SYMBOL_PAIRS', 'TRXUSDT,BTCUSDT,XRPUSDT').split(',') # Pares a vigilar
 INTERVAL = os.environ.get('INTERVAL', '15m')
 LEVERAGE = int(os.environ.get('LEVERAGE', 10))
 MIN_ORDER_USD = float(os.environ.get('MIN_ORDER_USD', 10.5))
@@ -45,7 +45,7 @@ RISK_PER_TRADE = float(os.environ.get('RISK_PER_TRADE', 0.075)) # 7.5% del capit
 
 # Parámetros de Machine Learning
 MODEL_CONFIDENCE_THRESHOLD = float(os.environ.get('MODEL_CONFIDENCE_THRESHOLD', 0.60)) # Min. 60% de confianza para ejecutar
-DAYS_FOR_TRAINING = int(os.environ.get('DAYS_FOR_TRAINING', 10))
+DAYS_FOR_TRAINING = int(os.environ.get('DAYS_FOR_TRAINING', 60)) # AUMENTADO A 60 DÍAS PARA MEJOR ENTRENAMIENTO
 
 # ---------------- ESTADO GLOBAL Y CLIENTES ----------------
 APP_STATE = {
@@ -160,7 +160,6 @@ def get_binance_data(symbol, interval, lookback_days):
             "close_time", "qav", "num_trades", "taker_base", "taker_quote", "ignore"
         ])
 
-        # --- INICIO DE LA CORRECCIÓN ---
         # 1. Convertir la columna de tiempo a formato datetime.
         data['open_time'] = pd.to_datetime(data['open_time'], unit='ms')
 
@@ -171,7 +170,6 @@ def get_binance_data(symbol, interval, lookback_days):
         numeric_cols = ["open", "high", "low", "close"]
         for col in numeric_cols:
             data[col] = data[col].astype(float)
-        # --- FIN DE LA CORRECCIÓN ---
 
         # CRÍTICO: Limpieza de duplicados de índice
         data.drop_duplicates(subset=['open_time'], keep='first', inplace=True)
@@ -183,7 +181,7 @@ def get_binance_data(symbol, interval, lookback_days):
         return pd.DataFrame()
 
 def calculate_indicators(df):
-    """Calcula las features de ML: RSI, MACD, EMA y Volatilidad."""
+    """Calcula las features de ML: RSI, MACD, EMA, Volatilidad y nuevos indicadores."""
     df_new = df.copy()
 
     # 1. RSI
@@ -210,6 +208,21 @@ def calculate_indicators(df):
                                              abs(df_new['low'] - df_new['close'].shift(1))))
     df_new['ATR'] = df_new['TR'].rolling(window=14).mean()
 
+    # --- INICIO DE NUEVOS INDICADORES ---
+    # 5. Bandas de Bollinger
+    rolling_mean_20 = df_new['close'].rolling(window=20).mean()
+    rolling_std_20 = df_new['close'].rolling(window=20).std()
+    df_new['bb_upper'] = rolling_mean_20 + (rolling_std_20 * 2)
+    df_new['bb_lower'] = rolling_mean_20 - (rolling_std_20 * 2)
+    df_new['bb_width'] = (df_new['bb_upper'] - df_new['bb_lower']) / rolling_mean_20 # Ancho de banda normalizado
+
+    # 6. Oscilador Estocástico
+    low_14 = df_new['low'].rolling(window=14).min()
+    high_14 = df_new['high'].rolling(window=14).max()
+    df_new['stoch_k'] = 100 * ((df_new['close'] - low_14) / (high_14 - low_14))
+    df_new['stoch_d'] = df_new['stoch_k'].rolling(window=3).mean()
+    # --- FIN DE NUEVOS INDICADORES ---
+
     return df_new.dropna()
 
 def create_target(df):
@@ -229,8 +242,8 @@ def create_target(df):
 
 def calculate_ml_features(df):
     """Prepara las features X para el modelo ML."""
-    # Features a usar:
-    X = df[['RSI', 'MACD', 'MACD_Signal', 'EMA_Diff', 'ATR']]
+    # Features a usar (incluyendo las nuevas):
+    X = df[['RSI', 'MACD', 'MACD_Signal', 'EMA_Diff', 'ATR', 'bb_width', 'stoch_k', 'stoch_d']]
     
     # Agrega el funding rate (que se añade al df en el ciclo principal)
     if 'funding_rate' in df.columns:
@@ -276,8 +289,17 @@ def initialize_ml_model(symbol):
         X_train_scaled = scaler.fit_transform(X_train)
         X_test_scaled = scaler.transform(X_test)
         
-        # 5. Entrenar el modelo XGBoost
-        model = XGBClassifier(use_label_encoder=False, eval_metric='logloss', n_estimators=100, random_state=42)
+        # 5. Entrenar el modelo XGBoost con parámetros mejorados
+        model = XGBClassifier(
+            use_label_encoder=False,
+            eval_metric='logloss',
+            n_estimators=150,
+            learning_rate=0.05,
+            max_depth=5,
+            subsample=0.8,
+            colsample_bytree=0.8,
+            random_state=42
+        )
         model.fit(X_train_scaled, y_train)
 
         # 6. Evaluación
@@ -539,14 +561,19 @@ def run_trading_bot():
             
             try:
                 # Obtener data histórica (se usa el cliente público y la nueva lógica de estabilidad)
-                df_data = get_binance_data(symbol, INTERVAL, 1) # Solo necesitamos 1 día de data para el ML en vivo
+                df_data = get_binance_data(symbol, INTERVAL, 2) # Solo necesitamos 2 días para el cálculo de indicadores en vivo
                 
-                if df_data.empty or len(df_data) < 26: # Mínimo necesario para EMA 26
+                if df_data.empty or len(df_data) < 30: # Mínimo necesario para los nuevos indicadores
                     logger.warning(f"⚠️ {symbol} - Data insuficiente para indicadores.")
                     continue
 
                 # 2.2.1. Calcular indicadores
                 df_indicators = calculate_indicators(df_data)
+                
+                if df_indicators.empty:
+                    logger.warning(f"⚠️ {symbol} - DataFrame vacío después de calcular indicadores.")
+                    continue
+
                 df_live = df_indicators.tail(1)
                 
                 current_price = df_live['close'].iloc[0]
@@ -632,3 +659,4 @@ if __name__ == '__main__':
     # Esta parte solo corre si ejecutas el archivo directamente (p.ej. python trading_bot.py)
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
+
