@@ -386,7 +386,12 @@ def run_trading_bot():
                     manage_positions(symbol, current_price)
                     continue
                 signal, confidence, mode = make_decision(symbol, df_indicators)
-                if signal in ['BUY', 'SELL'] and confidence >= MODEL_CONFIDENCE_THRESHOLD:
+                
+                # --- INICIO DE LA CORRECCIÓN ---
+                # La lógica de confianza ya está dentro de make_decision.
+                # La comprobación anterior era redundante y tenía un error para las órdenes 'SELL'.
+                if signal in ['BUY', 'SELL']:
+                # --- FIN DE LA CORRECCIÓN ---
                     logger.info(f"✨ {symbol} | Señal {mode}: {signal} (Conf: {confidence:.4f}) | Precio: {current_price:.4f}")
                     execute_order(symbol, signal, confidence)
                 else:
