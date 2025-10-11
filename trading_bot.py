@@ -25,7 +25,7 @@ API_KEY = os.environ.get('BINANCE_API_KEY', 'TU_API_KEY_AQUI')
 API_SECRET = os.environ.get('BINANCE_API_SECRET', 'TU_SECRET_KEY_AQUI')
 
 # CONFIGURACIÓN DEL BOT Y RIESGO
-CYCLE_DELAY_SECONDS = int(os.environ.get('CYCLE_DELAY_SECONDS', 1200)) # 20 minutos para reducir bloqueo de API
+CYCLE_DELAY_SECONDS = int(os.environ.get('CYCLE_DELAY_SECONDS', 300)) # 5 minutos para mayor reactividad
 FUTURES_TESTNET_URL = os.environ.get('FUTURES_TESTNET_URL', 'https://testnet.binancefuture.com')
 
 # Control de Modo y Entorno
@@ -434,4 +434,5 @@ def home():
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
+
 
