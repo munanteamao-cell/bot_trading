@@ -160,9 +160,18 @@ def get_binance_data(symbol, interval, lookback_days):
             "close_time", "qav", "num_trades", "taker_base", "taker_quote", "ignore"
         ])
 
-        # Conversión de tipos y limpieza
+        # --- INICIO DE LA CORRECCIÓN ---
+        # 1. Convertir la columna de tiempo a formato datetime.
         data['open_time'] = pd.to_datetime(data['open_time'], unit='ms')
-        data = data[["open_time", "open", "high", "low", "close"]].astype(float)
+
+        # 2. Seleccionar las columnas que nos interesan.
+        data = data[["open_time", "open", "high", "low", "close"]]
+
+        # 3. Convertir a float SOLO las columnas numéricas.
+        numeric_cols = ["open", "high", "low", "close"]
+        for col in numeric_cols:
+            data[col] = data[col].astype(float)
+        # --- FIN DE LA CORRECCIÓN ---
 
         # CRÍTICO: Limpieza de duplicados de índice
         data.drop_duplicates(subset=['open_time'], keep='first', inplace=True)
@@ -197,8 +206,8 @@ def calculate_indicators(df):
 
     # 4. Volatilidad (ATR Simple)
     df_new['TR'] = np.maximum(df_new['high'] - df_new['low'],
-                              np.maximum(abs(df_new['high'] - df_new['close'].shift(1)),
-                                         abs(df_new['low'] - df_new['close'].shift(1))))
+                                  np.maximum(abs(df_new['high'] - df_new['close'].shift(1)),
+                                             abs(df_new['low'] - df_new['close'].shift(1))))
     df_new['ATR'] = df_new['TR'].rolling(window=14).mean()
 
     return df_new.dropna()
@@ -496,7 +505,7 @@ def manage_positions(symbol, current_price):
             return
             
     # 2. Monitoreo Activo
-    logger.info(f"   ℹ️ {symbol} - Posición {position['side']} abierta. SL: {position['stop_loss']:.4f} | TP: {position['take_profit']:.4f}")
+    logger.info(f"    ℹ️ {symbol} - Posición {position['side']} abierta. SL: {position['stop_loss']:.4f} | TP: {position['take_profit']:.4f}")
     
 # ----------------------------------------------------------------------------------
 # CICLO PRINCIPAL Y ARRANQUE
@@ -555,7 +564,7 @@ def run_trading_bot():
                     logger.info(f"✨ {symbol} | Señal {mode}: {signal} (Conf: {confidence:.4f}) | Precio: {current_price:.4f}")
                     execute_order(symbol, signal, confidence)
                 else:
-                    logger.info(f"   ℹ️ {symbol} | Señal {mode}: HOLD (Conf: {confidence:.4f}) | Precio: {current_price:.4f}")
+                    logger.info(f"    ℹ️ {symbol} | Señal {mode}: HOLD (Conf: {confidence:.4f}) | Precio: {current_price:.4f}")
 
             except Exception as e:
                 logger.error(f"❌ Error al procesar {symbol}: {e}")
@@ -623,6 +632,3 @@ if __name__ == '__main__':
     # Esta parte solo corre si ejecutas el archivo directamente (p.ej. python trading_bot.py)
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
-
-
-
