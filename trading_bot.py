@@ -33,7 +33,7 @@ DRY_RUN = os.environ.get('DRY_RUN', 'true').lower() in ('1', 'true', 'yes')
 USE_TESTNET = os.environ.get('USE_TESTNET', 'true').lower() in ('1', 'true', 'yes') # ¡Usamos Testnet para simulación!
 
 # Parámetros de Trading
-SYMBOL_PAIRS = os.environ.get('SYMBOL_PAIRS', 'TRXUSDT,XRPUSDT').split(',') # Pares a vigilar
+SYMBOL_PAIRS = os.environ.get('SYMBOL_PAIRS', 'TRXUSDT,BTCUSDT').split(',') # Pares a vigilar
 INTERVAL = os.environ.get('INTERVAL', '15m')
 LEVERAGE = int(os.environ.get('LEVERAGE', 10))
 MIN_ORDER_USD = float(os.environ.get('MIN_ORDER_USD', 10.5))
@@ -45,7 +45,7 @@ RISK_PER_TRADE = float(os.environ.get('RISK_PER_TRADE', 0.075)) # 7.5% del capit
 
 # Parámetros de Machine Learning
 MODEL_CONFIDENCE_THRESHOLD = float(os.environ.get('MODEL_CONFIDENCE_THRESHOLD', 0.60)) # Min. 60% de confianza para ejecutar
-DAYS_FOR_TRAINING = int(os.environ.get('DAYS_FOR_TRAINING', 100))
+DAYS_FOR_TRAINING = int(os.environ.get('DAYS_FOR_TRAINING', 40))
 
 # ---------------- ESTADO GLOBAL Y CLIENTES ----------------
 APP_STATE = {
@@ -623,3 +623,4 @@ if __name__ == '__main__':
     # Esta parte solo corre si ejecutas el archivo directamente (p.ej. python trading_bot.py)
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
+
