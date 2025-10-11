@@ -45,7 +45,7 @@ RISK_PER_TRADE = float(os.environ.get('RISK_PER_TRADE', 0.075)) # 7.5% del capit
 
 # Parámetros de Machine Learning
 MODEL_CONFIDENCE_THRESHOLD = float(os.environ.get('MODEL_CONFIDENCE_THRESHOLD', 0.60)) # Min. 60% de confianza para ejecutar
-DAYS_FOR_TRAINING = int(os.environ.get('DAYS_FOR_TRAINING', 30))
+DAYS_FOR_TRAINING = int(os.environ.get('DAYS_FOR_TRAINING', 10))
 
 # ---------------- ESTADO GLOBAL Y CLIENTES ----------------
 APP_STATE = {
@@ -623,5 +623,6 @@ if __name__ == '__main__':
     # Esta parte solo corre si ejecutas el archivo directamente (p.ej. python trading_bot.py)
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
+
 
 
