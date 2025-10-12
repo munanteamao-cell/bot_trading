@@ -34,12 +34,11 @@ USE_TESTNET = os.environ.get('USE_TESTNET', 'true').lower() in ('1', 'true', 'ye
 # Parámetros de Trading
 SYMBOL_PAIRS = os.environ.get('SYMBOL_PAIRS', 'BTCUSDT,ETHUSDT,SOLUSDT,AVAXUSDT').split(',')
 INTERVAL = os.environ.get('INTERVAL', '15m')
-# --- MEJORA ESTRATÉGICA --- Timeframe para la tendencia a largo plazo
 LONG_TERM_INTERVAL = os.environ.get('LONG_TERM_INTERVAL', '4h')
 LEVERAGE = int(os.environ.get('LEVERAGE', 5))
-MIN_ORDER_USD = float(os.environ.get('MIN_ORDER_USD', 10.5))
+MIN_NOTIONAL_VALUE_USD = float(os.environ.get('MIN_NOTIONAL_VALUE_USD', 5.0))
 
-# --- MEJORA DE RIESGO --- Límite de posiciones abiertas simultáneamente
+# Límite de posiciones abiertas simultáneamente
 MAX_OPEN_POSITIONS = int(os.environ.get('MAX_OPEN_POSITIONS', 2))
 
 # Parámetros de Riesgo
@@ -155,17 +154,13 @@ def initialize_ml_model(symbol):
 
 def check_long_term_trend(symbol):
     """Verifica la tendencia principal en un timeframe mayor."""
-    df_long = get_binance_data(symbol, LONG_TERM_INTERVAL, 30) # 30 velas de 4h son 5 días
+    df_long = get_binance_data(symbol, LONG_TERM_INTERVAL, 30)
     if df_long.empty or len(df_long) < 50:
         logger.warning(f"⚠️ {symbol} - Data insuficiente en {LONG_TERM_INTERVAL} para definir tendencia.")
         return 'NEUTRAL'
-    
-    ema_50 = df_long['close'].ewm(span=50, adjust=False).mean()
-    current_price = df_long['close'].iloc[-1]
-    
-    if current_price > ema_50.iloc[-1]: return 'UPTREND'
-    elif current_price < ema_50.iloc[-1]: return 'DOWNTREND'
-    return 'NEUTRAL'
+    ema_50 = df_long['close'].ewm(span=50, adjust=False).mean().iloc[-1]
+    if df_long['close'].iloc[-1] > ema_50: return 'UPTREND'
+    return 'DOWNTREND'
     
 # ----------------------------------------------------------------------------------
 # FUNCIONES DE TRADING
@@ -194,10 +189,12 @@ def execute_order(symbol, side, confidence):
     dynamic_risk = 0.015 + (0.04 - 0.015) * conf_score
     usdt_margin = APP_STATE['balances']['free_USDT'] * dynamic_risk
     
-    if usdt_margin < MIN_ORDER_USD: return logger.warning(f"⚠️ {symbol} - Margen ({usdt_margin:.2f}) < Mínimo.")
+    notional_value = usdt_margin * LEVERAGE
+    if notional_value < MIN_NOTIONAL_VALUE_USD: 
+        return logger.info(f"    ℹ️ {symbol} - Valor Nocional ({notional_value:.2f}) < Mínimo. Señal ignorada.")
     
     prec = APP_STATE['symbol_precision'].get(symbol, {})
-    quantity = round_value((usdt_margin * LEVERAGE) / current_price, prec.get('quantity_precision', 0))
+    quantity = round_value(notional_value / current_price, prec.get('quantity_precision', 0))
     if quantity == 0: return logger.warning(f"⚠️ {symbol} - Cantidad es 0.")
 
     tp = round_value(current_price * (1 + TP_FACTOR if side == 'BUY' else 1 - TP_FACTOR), prec.get('price_precision', 0))
@@ -218,12 +215,8 @@ def manage_positions(symbol, current_price):
 
     pnl = (current_price - pos['entry_price']) * pos['quantity'] * (-1 if pos['side'] == 'SELL' else 1)
     close_reason = None
-    if pos['side'] == 'BUY':
-        if current_price >= pos['take_profit']: close_reason = 'TP'
-        elif current_price <= pos['stop_loss']: close_reason = 'SL'
-    elif pos['side'] == 'SELL':
-        if current_price <= pos['take_profit']: close_reason = 'TP'
-        elif current_price >= pos['stop_loss']: close_reason = 'SL'
+    if (pos['side'] == 'BUY' and current_price >= pos['take_profit']) or (pos['side'] == 'SELL' and current_price <= pos['take_profit']): close_reason = 'TP'
+    elif (pos['side'] == 'BUY' and current_price <= pos['stop_loss']) or (pos['side'] == 'SELL' and current_price >= pos['stop_loss']): close_reason = 'SL'
         
     if close_reason:
         APP_STATE['balances']['free_USDT'] += pos['margin_used'] + pnl
@@ -249,38 +242,58 @@ def run_trading_bot():
         if 'free_USDT' not in APP_STATE['balances']: APP_STATE['balances']['free_USDT'] = 1000.00
         logger.info(f"✅ Balances (SIM). USDT disponible: {APP_STATE['balances']['free_USDT']:.2f}")
         
+        # --- MEJORA ESTRATÉGICA: Lógica de Ranking de Oportunidades ---
+        potential_trades = []
+        
         for symbol in SYMBOL_PAIRS:
-            logger.info(f"⚙️ Procesando {symbol}...")
-            try:
-                if len(APP_STATE['open_positions']) >= MAX_OPEN_POSITIONS and symbol not in APP_STATE['open_positions']:
-                    logger.info(f"    ⚠️ Límite de {MAX_OPEN_POSITIONS} posiciones alcanzado. Saltando.")
-                    continue
+            # Solo analizar símbolos que no tienen una posición abierta
+            if symbol in APP_STATE['open_positions']:
+                logger.info(f"⚙️ Gestionando {symbol}...")
+                df = get_binance_data(symbol, INTERVAL, 2)
+                if not df.empty:
+                    manage_positions(symbol, df['close'].iloc[-1])
+                continue
 
+            logger.info(f"🔎 Buscando oportunidad en {symbol}...")
+            
+            # Si ya hemos alcanzado el límite de posiciones, no buscamos más.
+            if len(APP_STATE['open_positions']) >= MAX_OPEN_POSITIONS:
+                logger.info(f"    ⚠️ Límite de {MAX_OPEN_POSITIONS} posiciones alcanzado. Búsqueda detenida.")
+                break 
+
+            try:
                 df_short = get_binance_data(symbol, INTERVAL, 2)
                 if df_short.empty or len(df_short) < 30:
                     logger.warning(f"⚠️ {symbol} - Data {INTERVAL} insuficiente.")
                     continue
                 
-                df_indicators = calculate_indicators(df_short)
-                current_price = df_indicators.iloc[-1]['close']
-                
-                if symbol in APP_STATE['open_positions']:
-                    manage_positions(symbol, current_price)
-                    continue
-
                 long_term_trend = check_long_term_trend(symbol)
-                signal, confidence = make_decision(df_indicators)
-                display_conf = confidence if signal == 'BUY' else (1 - confidence if signal == 'SELL' else confidence)
-
+                signal, confidence = make_decision(calculate_indicators(df_short))
+                
                 if (signal == 'BUY' and long_term_trend == 'UPTREND') or (signal == 'SELL' and long_term_trend == 'DOWNTREND'):
-                    logger.info(f"✨ {symbol} | Señal: {signal} (Conf: {display_conf:.4f}) | Tendencia {LONG_TERM_INTERVAL}: {long_term_trend} | OK")
-                    execute_order(symbol, signal, confidence)
+                    actual_confidence = confidence if signal == 'BUY' else 1 - confidence
+                    potential_trades.append({'symbol': symbol, 'side': signal, 'confidence': confidence, 'display_confidence': actual_confidence})
+                    logger.info(f"    👍 {symbol} | Oportunidad encontrada: {signal} (Conf: {actual_confidence:.4f})")
                 else:
-                    logger.info(f"    ℹ️ {symbol} | Señal: {signal} (Conf: {display_conf:.4f}) | Tendencia {LONG_TERM_INTERVAL}: {long_term_trend} | SEÑAL FILTRADA")
+                    logger.info(f"    ✖️ {symbol} | Sin oportunidad clara o tendencia no alineada.")
 
             except Exception as e:
-                logger.error(f"❌ Error al procesar {symbol}: {e}")
-        
+                logger.error(f"❌ Error al analizar {symbol}: {e}")
+
+        # Ejecutar las mejores operaciones encontradas
+        if potential_trades:
+            # Ordenar por la confianza real de la operación
+            sorted_trades = sorted(potential_trades, key=lambda x: x['display_confidence'], reverse=True)
+            
+            logger.info(f"🏆 Ranking de oportunidades: {[f'{t["symbol"]}({t["display_confidence"]:.2f})' for t in sorted_trades]}")
+            
+            for trade in sorted_trades:
+                if len(APP_STATE['open_positions']) < MAX_OPEN_POSITIONS:
+                    logger.info(f" executing mejor opción: {trade['symbol']}")
+                    execute_order(trade['symbol'], trade['side'], trade['confidence'])
+                else:
+                    break # Detener si ya llenamos los cupos
+
         APP_STATE['last_run_utc'] = datetime.utcnow().isoformat()
         APP_STATE['status'] = 'SLEEPING'
         sleep_for = max(0, CYCLE_DELAY_SECONDS - (time.time() - start_time))
