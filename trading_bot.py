@@ -242,57 +242,55 @@ def run_trading_bot():
         if 'free_USDT' not in APP_STATE['balances']: APP_STATE['balances']['free_USDT'] = 1000.00
         logger.info(f"✅ Balances (SIM). USDT disponible: {APP_STATE['balances']['free_USDT']:.2f}")
         
-        # --- MEJORA ESTRATÉGICA: Lógica de Ranking de Oportunidades ---
-        potential_trades = []
+        # --- LÓGICA CORREGIDA ---
         
-        for symbol in SYMBOL_PAIRS:
-            # Solo analizar símbolos que no tienen una posición abierta
-            if symbol in APP_STATE['open_positions']:
-                logger.info(f"⚙️ Gestionando {symbol}...")
-                df = get_binance_data(symbol, INTERVAL, 2)
-                if not df.empty:
-                    manage_positions(symbol, df['close'].iloc[-1])
-                continue
+        # 1. Primero, gestionar siempre las posiciones existentes.
+        # Hacemos una copia de las keys para poder modificar el diccionario mientras iteramos
+        open_symbols = list(APP_STATE['open_positions'].keys())
+        for symbol in open_symbols:
+            logger.info(f"⚙️ Gestionando {symbol}...")
+            df = get_binance_data(symbol, INTERVAL, 2)
+            if not df.empty:
+                manage_positions(symbol, df['close'].iloc[-1])
+        
+        # 2. Después, buscar nuevas oportunidades si hay cupos.
+        if len(APP_STATE['open_positions']) < MAX_OPEN_POSITIONS:
+            potential_trades = []
+            for symbol in SYMBOL_PAIRS:
+                if symbol not in APP_STATE['open_positions']:
+                    logger.info(f"🔎 Buscando oportunidad en {symbol}...")
+                    try:
+                        df_short = get_binance_data(symbol, INTERVAL, 2)
+                        if df_short.empty or len(df_short) < 30:
+                            logger.warning(f"⚠️ {symbol} - Data {INTERVAL} insuficiente.")
+                            continue
+                        
+                        long_term_trend = check_long_term_trend(symbol)
+                        signal, confidence = make_decision(calculate_indicators(df_short))
+                        
+                        if (signal == 'BUY' and long_term_trend == 'UPTREND') or (signal == 'SELL' and long_term_trend == 'DOWNTREND'):
+                            actual_confidence = confidence if signal == 'BUY' else 1 - confidence
+                            potential_trades.append({'symbol': symbol, 'side': signal, 'confidence': confidence, 'display_confidence': actual_confidence})
+                            logger.info(f"    👍 {symbol} | Oportunidad encontrada: {signal} (Conf: {actual_confidence:.4f})")
+                        else:
+                             logger.info(f"    ✖️ {symbol} | Sin oportunidad clara o tendencia no alineada.")
 
-            logger.info(f"🔎 Buscando oportunidad en {symbol}...")
+                    except Exception as e:
+                        logger.error(f"❌ Error al analizar {symbol}: {e}")
             
-            # Si ya hemos alcanzado el límite de posiciones, no buscamos más.
-            if len(APP_STATE['open_positions']) >= MAX_OPEN_POSITIONS:
-                logger.info(f"    ⚠️ Límite de {MAX_OPEN_POSITIONS} posiciones alcanzado. Búsqueda detenida.")
-                break 
-
-            try:
-                df_short = get_binance_data(symbol, INTERVAL, 2)
-                if df_short.empty or len(df_short) < 30:
-                    logger.warning(f"⚠️ {symbol} - Data {INTERVAL} insuficiente.")
-                    continue
+            # Ejecutar las mejores operaciones
+            if potential_trades:
+                sorted_trades = sorted(potential_trades, key=lambda x: x['display_confidence'], reverse=True)
+                logger.info(f"🏆 Ranking de oportunidades: {[f'{t["symbol"]}({t["display_confidence"]:.2f})' for t in sorted_trades]}")
                 
-                long_term_trend = check_long_term_trend(symbol)
-                signal, confidence = make_decision(calculate_indicators(df_short))
-                
-                if (signal == 'BUY' and long_term_trend == 'UPTREND') or (signal == 'SELL' and long_term_trend == 'DOWNTREND'):
-                    actual_confidence = confidence if signal == 'BUY' else 1 - confidence
-                    potential_trades.append({'symbol': symbol, 'side': signal, 'confidence': confidence, 'display_confidence': actual_confidence})
-                    logger.info(f"    👍 {symbol} | Oportunidad encontrada: {signal} (Conf: {actual_confidence:.4f})")
-                else:
-                    logger.info(f"    ✖️ {symbol} | Sin oportunidad clara o tendencia no alineada.")
-
-            except Exception as e:
-                logger.error(f"❌ Error al analizar {symbol}: {e}")
-
-        # Ejecutar las mejores operaciones encontradas
-        if potential_trades:
-            # Ordenar por la confianza real de la operación
-            sorted_trades = sorted(potential_trades, key=lambda x: x['display_confidence'], reverse=True)
-            
-            logger.info(f"🏆 Ranking de oportunidades: {[f'{t["symbol"]}({t["display_confidence"]:.2f})' for t in sorted_trades]}")
-            
-            for trade in sorted_trades:
-                if len(APP_STATE['open_positions']) < MAX_OPEN_POSITIONS:
-                    logger.info(f" executing mejor opción: {trade['symbol']}")
-                    execute_order(trade['symbol'], trade['side'], trade['confidence'])
-                else:
-                    break # Detener si ya llenamos los cupos
+                for trade in sorted_trades:
+                    if len(APP_STATE['open_positions']) < MAX_OPEN_POSITIONS:
+                        logger.info(f"⚡ Ejecutando mejor opción: {trade['symbol']}")
+                        execute_order(trade['symbol'], trade['side'], trade['confidence'])
+                    else:
+                        break
+        else:
+            logger.info("ℹ️ Límite de posiciones alcanzado. Solo se gestionarán las existentes.")
 
         APP_STATE['last_run_utc'] = datetime.utcnow().isoformat()
         APP_STATE['status'] = 'SLEEPING'
